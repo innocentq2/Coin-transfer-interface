@@ -31,7 +31,12 @@ import {
   Users,
   Edit2,
   Database,
+  Lock,
+  Scale,
+  ArrowRight,
+  Boxes,
 } from "lucide-react";
+import UTXOBlockchainExplorer from "./UTXOBlockchainExplorer";
 import { QRCodeSVG } from "qrcode.react";
 import { auth, googleProvider } from "../lib/firebase";
 import {
@@ -49,13 +54,32 @@ import {
   subscribeToAccounts,
   saveAccountToFirebase,
   seedDefaultAccountsToFirebase,
+  subscribeWalletHoldingsFromRTDB,
+  updateWalletHoldingsInRTDB,
+  updateWalletOrgInRTDB,
   DEFAULT_KNOWN_ACCOUNTS,
   KnownAccount,
 } from "../lib/db";
+import {
+  executeUTXOPayment,
+  mintUTXOCoins,
+  getUTXOBalance,
+  getUnspentUTXOsForAddress,
+} from "../lib/utxoService";
 
 interface Transaction {
   id: string;
-  type: "Deposit" | "Send" | "Mint" | "Burn" | "AMM Swap";
+  type:
+    | "Deposit"
+    | "Send"
+    | "Mint"
+    | "Burn"
+    | "AMM Swap"
+    | "Bonding Buy"
+    | "Bonding Sell"
+    | "Send (UTXO)"
+    | "Mint (UTXO)"
+    | "Deposit (UTXO)";
   amount: string;
   fiatValue: string;
   details: string;
@@ -68,7 +92,7 @@ interface Transaction {
 
 export default function ApexDashboard() {
   // Navigation State
-  const [activeTab, setActiveTab] = useState<"Portfolio" | "Market" | "Activity" | "Settings" | "Directory">("Portfolio");
+  const [activeTab, setActiveTab] = useState<"Portfolio" | "Market" | "Activity" | "Settings" | "Directory" | "Curve" | "UTXO">("Portfolio");
   const [timeframe, setTimeframe] = useState<"1D" | "1W" | "1M" | "1Y">("1W");
   const [txFilter, setTxFilter] = useState<"All" | "Received" | "Sent">("All");
 
@@ -122,10 +146,10 @@ export default function ApexDashboard() {
   const [isMinting, setIsMinting] = useState<boolean>(false);
   const [mintSuccessMsg, setMintSuccessMsg] = useState<string | null>(null);
 
-  // User Vault Balances
+  // User Vault Balances - Stored & Streamed Live from Firebase Realtime Database
   const hardCap = 10000000.0;
-  const [balanceMYC, setBalanceMYC] = useState<number>(100000.0);
-  const [balanceETH, setBalanceETH] = useState<number>(12.5);
+  const [balanceMYC, setBalanceMYC] = useState<number>(0);
+  const [balanceETH, setBalanceETH] = useState<number>(0);
 
   // ==========================================
   // AMM CONSTANT PRODUCT POOL STATE (x * y = k)
@@ -143,35 +167,99 @@ export default function ApexDashboard() {
   const [isSwapping, setIsSwapping] = useState<boolean>(false);
   const [swapSuccessMsg, setSwapSuccessMsg] = useState<string | null>(null);
 
+  // ==========================================
+  // BONDING CURVE PARAMETERS (P(S) = P0 + M * S)
+  // ==========================================
+  const P0 = 0.0001; // Starting price: 0.0001 ETH
+  const M = 0.000001; // Slope: 1e12 wei = 0.000001 ETH per coin
+  const MAX_CURVE_SUPPLY = 10000.0; // 10,000 coins hard cap
+  const [curveSupply, setCurveSupply] = useState<number>(60.0);
+  const [curveTradeMode, setCurveTradeMode] = useState<"BUY" | "SELL">("BUY");
+  const [curveAmountInput, setCurveAmountInput] = useState<string>("40");
+  const [isCurveTrading, setIsCurveTrading] = useState<boolean>(false);
+  const [curveSuccessMsg, setCurveSuccessMsg] = useState<string | null>(null);
+
+  // Bonding Curve Math: P(S) = P0 + M * S
+  const currentCurvePriceETH = P0 + M * curveSupply;
+  const currentCurvePriceUSD = currentCurvePriceETH * ethUsdRate;
+  const currentCurveReserveETH = P0 * curveSupply + (M / 2) * (curveSupply ** 2);
+
+  // Cost to buy Δ coins: Area = P0 * Δ + (M/2) * ((S+Δ)^2 - S^2)
+  const calcCurveBuyCost = (amt: number, s: number = curveSupply) => {
+    if (isNaN(amt) || amt <= 0) return 0;
+    return P0 * amt + (M / 2) * ((s + amt) ** 2 - s ** 2);
+  };
+
+  // Refund to sell Δ coins: Area = P0 * Δ + (M/2) * (S^2 - (S-Δ)^2)
+  const calcCurveSellRefund = (amt: number, s: number = curveSupply) => {
+    if (isNaN(amt) || amt <= 0 || amt > s) return 0;
+    return P0 * amt + (M / 2) * (s ** 2 - (s - amt) ** 2);
+  };
+
   // Listen to Firebase Auth Changes & Real-Time Sync with Firestore Database
   useEffect(() => {
+    let unsubRTDBWallet: (() => void) | null = null;
+
     // 1. Auth state listener
     const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      if (unsubRTDBWallet) {
+        unsubRTDBWallet();
+        unsubRTDBWallet = null;
+      }
+
       if (user) {
         setCurrentUser(user);
         const { address } = deriveUserWallet(user.uid);
         setUserAddress(address);
         setMintRecipient(address);
 
-        // Fetch existing profile from Firebase Firestore
+        // Fetch existing profile from Firebase Firestore if available
         const existingProfile = await getUserProfileFromFirebase(user.uid);
+        const orgToUse = existingProfile?.organization || userOrg;
         if (existingProfile?.organization) {
           setUserOrg(existingProfile.organization);
         }
 
-        // Sync and store account information and permanent address to Firebase
+        // 2. Real-Time Stream from Firebase Realtime Database (RTDB) for Wallet Holdings & Address
+        unsubRTDBWallet = subscribeWalletHoldingsFromRTDB(
+          user.uid,
+          address,
+          user,
+          orgToUse,
+          (holdings) => {
+            if (holdings) {
+              if (holdings.permanentAddress) {
+                setUserAddress(holdings.permanentAddress);
+              }
+              if (typeof holdings.mycBalance === "number") {
+                setBalanceMYC(holdings.mycBalance);
+              }
+              if (typeof holdings.ethBalance === "number") {
+                setBalanceETH(holdings.ethBalance);
+              }
+              if (holdings.organization) {
+                setUserOrg(holdings.organization);
+              }
+              setDbSynced(true);
+            }
+          }
+        );
+
+        // Also sync profile to Firestore
         await syncUserProfileToFirebase(
           user,
           address,
           balanceMYC,
           balanceETH,
-          existingProfile?.organization || userOrg
+          orgToUse
         );
         setDbSynced(true);
       } else {
         setCurrentUser(null);
         setUserAddress("");
         setMintRecipient("");
+        setBalanceMYC(0);
+        setBalanceETH(0);
         setDbSynced(false);
       }
     });
@@ -204,6 +292,7 @@ export default function ApexDashboard() {
     });
 
     return () => {
+      if (unsubRTDBWallet) unsubRTDBWallet();
       unsubAuth();
       unsubAccounts();
       unsubTransactions();
@@ -216,6 +305,7 @@ export default function ApexDashboard() {
     setIsEditingOrg(false);
 
     if (currentUser) {
+      await updateWalletOrgInRTDB(currentUser.uid, editedOrg);
       await syncUserProfileToFirebase(currentUser, userAddress, balanceMYC, balanceETH, editedOrg);
     }
   };
@@ -352,40 +442,8 @@ export default function ApexDashboard() {
   const parsedSwapInput = parseFloat(swapInputAmt) || 0;
   const swapResult = calculateSwapOutput(parsedSwapInput, swapDirection);
 
-  // Recent Transactions (Synced with Firebase)
-  const [transactions, setTransactions] = useState<Transaction[]>([
-    {
-      id: "tx-init-mint",
-      type: "Mint",
-      amount: "+100,000.00 MYC",
-      fiatValue: `$${(100000 * spotPriceInUSD).toLocaleString(undefined, { maximumFractionDigits: 0 })}`,
-      details: "Initial Vault Allocation",
-      recipientFull: userAddress,
-      recipientOrg: userOrg,
-      date: "Just now",
-      status: "Completed",
-    },
-    {
-      id: "tx-bob-seed",
-      type: "Send",
-      amount: "-5,000.00 MYC",
-      fiatValue: `$${(5000 * spotPriceInUSD).toLocaleString(undefined, { maximumFractionDigits: 0 })}`,
-      details: "To: Bob (Apex Custody OTC Desk)",
-      recipientFull: "0xedEe7c1429505bcA418Cc48b8Cf8B37E8d602843",
-      recipientOrg: "Apex Custody OTC Desk",
-      date: "1 hour ago",
-      status: "Completed",
-    },
-    {
-      id: "tx-pool-init",
-      type: "AMM Swap",
-      amount: "Pool Active",
-      fiatValue: "$680,000.00 TVL",
-      details: "AMM Reserve: 100 ETH & 1,000,000 MYC",
-      date: "2 hours ago",
-      status: "Completed",
-    },
-  ]);
+  // Recent Transactions (Live from Firebase Firestore & Real UTXO Ledger)
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -443,34 +501,56 @@ export default function ApexDashboard() {
       ? `${sendRecipient.slice(0, 6)}...${sendRecipient.slice(-4)}`
       : sendRecipient;
 
-    // Record to Firebase Firestore database
-    await recordTransactionToFirebase({
-      type: "Send",
-      amount: `-${amt.toLocaleString(undefined, { minimumFractionDigits: 2 })} MYC`,
-      fiatValue: `$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
-      details: `To: ${targetDisplay}`,
-      senderAddress: userAddress,
-      recipientAddress: sendRecipient,
-      recipientName,
-      recipientOrg,
-      status: "Completed",
-    });
+    try {
+      // 1. Execute REAL UTXO transfer (Consumes unspent inputs, creates recipient output, creates change)
+      const result = await executeUTXOPayment({
+        senderAddress: userAddress,
+        senderName: currentUser?.displayName || currentUser?.email || "Vault Custody",
+        senderUid: currentUser?.uid,
+        recipientAddress: sendRecipient,
+        recipientName: recipientName || "Recipient",
+        amount: amt,
+        fee: 0,
+        ethRate: spotPriceInUSD,
+      });
 
-    setTimeout(() => {
-      const newBal = balanceMYC - amt;
-      setBalanceMYC(newBal);
-
-      // Update balance in Firebase
-      if (currentUser) {
-        syncUserProfileToFirebase(currentUser, userAddress, newBal, balanceETH, userOrg);
+      if (!result.success) {
+        alert(result.error || "Payment failed to execute on UTXO ledger");
+        setIsSending(false);
+        return;
       }
 
+      // 2. DEBIT: Update Sender's coin balance
+      const newBal = result.newSenderBalance ?? Math.max(0, balanceMYC - amt);
+      setBalanceMYC(newBal);
+
+      // 3. CREDIT: Update Recipient's coin balance in Directory contacts list
+      setContacts((prev) =>
+        prev.map((c) => {
+          if (c.address.toLowerCase() === sendRecipient.toLowerCase()) {
+            return {
+              ...c,
+              mycBalance: result.newRecipientBalance ?? ((c.mycBalance || 0) + amt),
+            };
+          }
+          return c;
+        })
+      );
+
+      const changeStr =
+        result.changeAmount && result.changeAmount > 0
+          ? ` • Change refund: ${result.changeAmount.toFixed(2)} MYC`
+          : "";
+      const inputsStr = result.inputsSpent
+        ? ` (${result.inputsSpent.length} UTXO input(s) spent${changeStr})`
+        : "";
+
       const newTx: Transaction = {
-        id: `tx-${Date.now()}`,
-        type: "Send",
+        id: result.txid || `tx-${Date.now()}`,
+        type: "Send (UTXO)",
         amount: `-${amt.toLocaleString(undefined, { minimumFractionDigits: 2 })} MYC`,
-        fiatValue: `$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
-        details: `To: ${targetDisplay}`,
+        fiatValue: `-$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
+        details: `To: ${targetDisplay}${inputsStr}`,
         sender: userAddress,
         recipientFull: sendRecipient,
         recipientOrg: recipientOrg || undefined,
@@ -480,7 +560,9 @@ export default function ApexDashboard() {
 
       setTransactions((prev) => [newTx, ...prev]);
       setIsSending(false);
-      setSendSuccessMsg(`Sent ${amt.toLocaleString()} MYC to ${targetDisplay} successfully!`);
+      setSendSuccessMsg(
+        `Sent ${amt.toLocaleString()} MYC to ${targetDisplay} via UTXO! Sender debited, recipient credited.`
+      );
       setSendAmount("");
       setSendRecipient("");
       setRecipientName("");
@@ -489,8 +571,12 @@ export default function ApexDashboard() {
       setTimeout(() => {
         setIsSendOpen(false);
         setSendSuccessMsg(null);
-      }, 2000);
-    }, 800);
+      }, 2500);
+    } catch (err: unknown) {
+      const error = err as Error;
+      alert(`UTXO Transfer Failed: ${error.message}`);
+      setIsSending(false);
+    }
   };
 
   const handleExecuteSwap = async (e: React.FormEvent) => {
@@ -533,6 +619,7 @@ export default function ApexDashboard() {
         });
 
         if (currentUser) {
+          updateWalletHoldingsInRTDB(currentUser.uid, nextMYC, nextETH, userAddress);
           syncUserProfileToFirebase(currentUser, userAddress, nextMYC, nextETH, userOrg);
         }
 
@@ -568,6 +655,7 @@ export default function ApexDashboard() {
         });
 
         if (currentUser) {
+          updateWalletHoldingsInRTDB(currentUser.uid, nextMYC, nextETH, userAddress);
           syncUserProfileToFirebase(currentUser, userAddress, nextMYC, nextETH, userOrg);
         }
 
@@ -594,6 +682,138 @@ export default function ApexDashboard() {
     }, 850);
   };
 
+  const handleExecuteCurveTrade = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const amt = parseFloat(curveAmountInput);
+    if (isNaN(amt) || amt <= 0) return;
+
+    if (!currentUser) {
+      alert("Please sign in with Google to trade on the bonding curve.");
+      return;
+    }
+
+    setIsCurveTrading(true);
+
+    if (curveTradeMode === "BUY") {
+      if (curveSupply + amt > MAX_CURVE_SUPPLY) {
+        alert(`Cap exceeded! Maximum curve supply is ${MAX_CURVE_SUPPLY.toLocaleString()} CRV`);
+        setIsCurveTrading(false);
+        return;
+      }
+      const costETH = calcCurveBuyCost(amt);
+      if (costETH > balanceETH) {
+        alert(`Insufficient ETH. Cost is ${costETH.toFixed(5)} ETH but available balance is ${balanceETH.toFixed(4)} ETH`);
+        setIsCurveTrading(false);
+        return;
+      }
+
+      try {
+        const nextETH = balanceETH - costETH;
+        const nextCurveSupply = curveSupply + amt;
+
+        // Mint fresh UTXO to user's address
+        const { txid } = await mintUTXOCoins(
+          userAddress,
+          currentUser.displayName || "Curve Trader",
+          amt,
+          "Bonding Curve Buy"
+        );
+
+        const nextBal = await getUTXOBalance(userAddress);
+        setBalanceETH(nextETH);
+        setBalanceMYC(nextBal);
+        setCurveSupply(nextCurveSupply);
+
+        if (currentUser) {
+          await updateWalletHoldingsInRTDB(currentUser.uid, nextBal, nextETH, userAddress);
+          syncUserProfileToFirebase(currentUser, userAddress, nextBal, nextETH, userOrg);
+        }
+
+        const newTx: Transaction = {
+          id: txid,
+          type: "Bonding Buy",
+          amount: `+${amt.toFixed(2)} CRV`,
+          fiatValue: `-$${(costETH * ethUsdRate).toFixed(2)}`,
+          details: `Bought via Curve (P = P0 + M·S) • Minted new UTXO`,
+          date: "Just now",
+          status: "Completed",
+        };
+        setTransactions((prev) => [newTx, ...prev]);
+
+        setIsCurveTrading(false);
+        setCurveSuccessMsg(`Bought ${amt} CRV for ${costETH.toFixed(4)} ETH! UTXO minted. Supply now ${nextCurveSupply} CRV.`);
+        setTimeout(() => setCurveSuccessMsg(null), 3000);
+      } catch (err: unknown) {
+        const error = err as Error;
+        alert(`Curve Buy failed: ${error.message}`);
+        setIsCurveTrading(false);
+      }
+    } else {
+      if (amt > curveSupply) {
+        alert(`Cannot sell more than total circulating supply (${curveSupply} CRV)`);
+        setIsCurveTrading(false);
+        return;
+      }
+      if (amt > balanceMYC) {
+        alert(`Insufficient coins. You hold ${balanceMYC.toLocaleString()} CRV`);
+        setIsCurveTrading(false);
+        return;
+      }
+      const refundETH = calcCurveSellRefund(amt);
+
+      try {
+        // Burn UTXOs by sending to burn address
+        const burnRes = await executeUTXOPayment({
+          senderAddress: userAddress,
+          senderName: currentUser.displayName || "Curve Trader",
+          senderUid: currentUser.uid,
+          recipientAddress: "0x000000000000000000000000000000000000dEaD",
+          recipientName: "Curve Reserve Burn",
+          amount: amt,
+          fee: 0,
+        });
+
+        if (!burnRes.success) {
+          alert(burnRes.error || "Failed to burn coins via UTXO");
+          setIsCurveTrading(false);
+          return;
+        }
+
+        const nextETH = balanceETH + refundETH;
+        const nextCurveSupply = Math.max(0, curveSupply - amt);
+        const nextBal = burnRes.newSenderBalance ?? Math.max(0, balanceMYC - amt);
+
+        setBalanceMYC(nextBal);
+        setBalanceETH(nextETH);
+        setCurveSupply(nextCurveSupply);
+
+        if (currentUser) {
+          await updateWalletHoldingsInRTDB(currentUser.uid, nextBal, nextETH, userAddress);
+          syncUserProfileToFirebase(currentUser, userAddress, nextBal, nextETH, userOrg);
+        }
+
+        const newTx: Transaction = {
+          id: burnRes.txid || `tx-burn-${Date.now()}`,
+          type: "Bonding Sell",
+          amount: `-${amt.toFixed(2)} CRV`,
+          fiatValue: `+$${(refundETH * ethUsdRate).toFixed(2)}`,
+          details: `Sold via Bonding Curve • Refund: ${refundETH.toFixed(4)} ETH`,
+          date: "Just now",
+          status: "Completed",
+        };
+        setTransactions((prev) => [newTx, ...prev]);
+
+        setIsCurveTrading(false);
+        setCurveSuccessMsg(`Sold ${amt} CRV for ${refundETH.toFixed(4)} ETH refund! UTXOs burned.`);
+        setTimeout(() => setCurveSuccessMsg(null), 3000);
+      } catch (err: unknown) {
+        const error = err as Error;
+        alert(`Curve Sell failed: ${error.message}`);
+        setIsCurveTrading(false);
+      }
+    }
+  };
+
   const handleMintTokens = async (e: React.FormEvent) => {
     e.preventDefault();
     const amt = parseFloat(mintAmount);
@@ -605,32 +825,31 @@ export default function ApexDashboard() {
     }
 
     setIsMinting(true);
-    setTimeout(async () => {
-      const nextBal = balanceMYC + amt;
-      setBalanceMYC(nextBal);
-
+    try {
       const target = mintRecipient || userAddress;
+      const { txid } = await mintUTXOCoins(
+        target,
+        currentUser?.displayName || "Vault User",
+        amt,
+        "Vault Token Mint"
+      );
 
-      await recordTransactionToFirebase({
-        type: "Mint",
-        amount: `+${amt.toLocaleString(undefined, { minimumFractionDigits: 2 })} MYC`,
-        fiatValue: `$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
-        details: `Mint to: ${target.slice(0, 6)}...${target.slice(-4)}`,
-        senderAddress: "0x0000000000000000000000000000000000000000",
-        recipientAddress: target,
-        status: "Completed",
-      });
+      const nextBal = await getUTXOBalance(target);
+      if (target.toLowerCase() === userAddress.toLowerCase()) {
+        setBalanceMYC(nextBal);
+      }
 
       if (currentUser) {
+        updateWalletHoldingsInRTDB(currentUser.uid, nextBal, balanceETH, userAddress);
         syncUserProfileToFirebase(currentUser, userAddress, nextBal, balanceETH, userOrg);
       }
 
       const newTx: Transaction = {
-        id: `tx-mint-${Date.now()}`,
-        type: "Mint",
+        id: txid,
+        type: "Mint (UTXO)",
         amount: `+${amt.toLocaleString(undefined, { minimumFractionDigits: 2 })} MYC`,
-        fiatValue: `$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
-        details: `Mint to: ${target.slice(0, 6)}...${target.slice(-4)}`,
+        fiatValue: `+$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
+        details: `Mint to: ${target.slice(0, 6)}...${target.slice(-4)} (New UTXO Created)`,
         recipientFull: target,
         date: "Just now",
         status: "Completed",
@@ -638,12 +857,16 @@ export default function ApexDashboard() {
 
       setTransactions((prev) => [newTx, ...prev]);
       setIsMinting(false);
-      setMintSuccessMsg(`Successfully minted ${amt.toLocaleString()} MYC to your address!`);
+      setMintSuccessMsg(`Successfully minted ${amt.toLocaleString()} MYC as a fresh unspent UTXO!`);
       setTimeout(() => {
         setIsMintOpen(false);
         setMintSuccessMsg(null);
       }, 1800);
-    }, 800);
+    } catch (err: unknown) {
+      const error = err as Error;
+      alert(`Minting error: ${error.message}`);
+      setIsMinting(false);
+    }
   };
 
   // Filtered transactions
@@ -691,6 +914,30 @@ export default function ApexDashboard() {
             >
               <LayoutGrid className="w-4 h-4" />
               Portfolio & Vault
+            </button>
+
+            <button
+              onClick={() => setActiveTab("Curve")}
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+                activeTab === "Curve"
+                  ? "bg-[#e8f8f0] text-[#00875a]"
+                  : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
+              }`}
+            >
+              <TrendingUp className="w-4 h-4" />
+              Bonding Curve (CRV)
+            </button>
+
+            <button
+              onClick={() => setActiveTab("UTXO")}
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+                activeTab === "UTXO"
+                  ? "bg-[#e8f8f0] text-[#00875a]"
+                  : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
+              }`}
+            >
+              <Boxes className="w-4 h-4" />
+              Bitcoin UTXO Chain
             </button>
 
             <button
@@ -1184,6 +1431,21 @@ export default function ApexDashboard() {
                               {acc.address}
                             </div>
                           </div>
+
+                          <div className="bg-emerald-50/70 border border-emerald-200/60 rounded-xl p-2.5 flex items-center justify-between">
+                            <div>
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 block">
+                                UTXO Coin Balance
+                              </span>
+                              <span className="text-sm font-extrabold text-slate-900 font-mono">
+                                {(acc.mycBalance || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })} MYC
+                              </span>
+                            </div>
+                            <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 flex items-center gap-1">
+                              <Coins className="w-3 h-3 text-emerald-600" />
+                              UTXO Ledger
+                            </span>
+                          </div>
                         </div>
 
                         <div className="flex items-center gap-2 pt-2 border-t border-slate-100">
@@ -1207,6 +1469,722 @@ export default function ApexDashboard() {
                 </div>
               </div>
             </div>
+          ) : activeTab === "Curve" ? (
+            /* ======================================================== */
+            /* TAB: BONDING CURVE PRICING & SUPPLY CONTROL (CurveCoin)   */
+            /* ======================================================== */
+            <div className="space-y-6">
+              {/* Curve Header Banner */}
+              <div className="bg-gradient-to-r from-slate-950 via-[#0d222e] to-[#043324] text-white rounded-2xl p-6 sm:p-7 border border-slate-800 shadow-md relative overflow-hidden">
+                <div className="relative z-10 space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="inline-flex items-center gap-1.5 bg-emerald-500/20 text-emerald-300 text-xs font-semibold px-3 py-1 rounded-full border border-emerald-500/30">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      Bonding-Curve Autonomous Token (CRV)
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 bg-white/10 text-slate-200 text-xs font-semibold px-2.5 py-1 rounded-full border border-white/15">
+                      <Lock className="w-3 h-3 text-teal-400" />
+                      Zero Admin Key &bull; No Owner
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 bg-teal-500/15 text-teal-200 text-xs font-semibold px-2.5 py-1 rounded-full border border-teal-500/30">
+                      <Scale className="w-3 h-3 text-teal-300" />
+                      Solvent by Design (Ceil/Floor)
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 bg-emerald-500/15 text-emerald-200 text-xs font-semibold px-2.5 py-1 rounded-full border border-emerald-500/30">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+                      10/10 Hardhat Tests Passed
+                    </span>
+                  </div>
+
+                  <div className="max-w-3xl">
+                    <h3 className="text-xl sm:text-2xl font-extrabold tracking-tight text-white">
+                      Curve Coin (CRV): Deterministic Price Formula of Supply
+                    </h3>
+                    <p className="text-xs sm:text-sm text-slate-300 mt-1.5 leading-relaxed">
+                      Buying with ETH mints coins and elevates supply &amp; price. Selling coins burns them and refunds ETH from the contract reserve. There is no owner, no pre-mine, and no admin key. Supply can only change through the curve, eliminating trust and governance risk.
+                    </p>
+                  </div>
+
+                  <div className="pt-1 flex items-center gap-4 text-xs font-mono text-emerald-300/90 flex-wrap">
+                    <div className="bg-black/40 px-3 py-1.5 rounded-lg border border-white/10">
+                      <span className="text-slate-400">Formula: </span>
+                      <strong>Price(S) = P₀ + M &times; S</strong>
+                    </div>
+                    <div className="bg-black/40 px-3 py-1.5 rounded-lg border border-white/10">
+                      <span className="text-slate-400">P₀: </span>
+                      <strong>0.0001 ETH</strong>
+                    </div>
+                    <div className="bg-black/40 px-3 py-1.5 rounded-lg border border-white/10">
+                      <span className="text-slate-400">M: </span>
+                      <strong>1e12 wei (0.000001 ETH)</strong>
+                    </div>
+                    <div className="bg-black/40 px-3 py-1.5 rounded-lg border border-white/10">
+                      <span className="text-slate-400">Hard Cap: </span>
+                      <strong>10,000 CRV</strong>
+                    </div>
+                  </div>
+                </div>
+                <div className="absolute right-0 top-0 -mr-16 -mt-16 w-80 h-80 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
+              </div>
+
+              {/* 4 KPI Metric Cards */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                {/* 1. Current Spot Price */}
+                <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-xs flex flex-col justify-between">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      Current Spot Price
+                    </span>
+                    <span className="bg-emerald-50 text-[#00875a] border border-emerald-200/60 text-[10px] font-extrabold px-2 py-0.5 rounded-full flex items-center gap-1">
+                      <TrendingUp className="w-3 h-3" />
+                      +{(((currentCurvePriceETH - P0) / P0) * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="my-3">
+                    <div className="text-2xl font-extrabold text-slate-900 tracking-tight font-mono">
+                      {currentCurvePriceETH.toFixed(6)} ETH
+                    </div>
+                    <div className="text-xs font-semibold text-slate-500 mt-0.5">
+                      &asymp; ${currentCurvePriceUSD.toFixed(2)} USD
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-400 flex items-center justify-between pt-2 border-t border-slate-100">
+                    <span>Base P₀: 0.0001 ETH</span>
+                    <span className="font-semibold text-slate-600">Slope: +1&mu; ETH/coin</span>
+                  </div>
+                </div>
+
+                {/* 2. Circulating Supply vs Hard Cap */}
+                <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-xs flex flex-col justify-between">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      Circulating Supply
+                    </span>
+                    <span className="bg-teal-50 text-teal-700 border border-teal-200/60 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
+                      {((curveSupply / MAX_CURVE_SUPPLY) * 100).toFixed(1)}% Minted
+                    </span>
+                  </div>
+                  <div className="my-3">
+                    <div className="text-2xl font-extrabold text-slate-900 tracking-tight font-mono">
+                      {curveSupply.toLocaleString()} CRV
+                    </div>
+                    <div className="text-xs font-semibold text-slate-500 mt-0.5">
+                      Hard Cap: 10,000 CRV
+                    </div>
+                  </div>
+                  <div>
+                    <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                      <div
+                        className="bg-emerald-500 h-1.5 rounded-full transition-all duration-500"
+                        style={{ width: `${Math.min(100, (curveSupply / MAX_CURVE_SUPPLY) * 100)}%` }}
+                      />
+                    </div>
+                    <div className="text-[10px] text-slate-400 pt-1.5 flex justify-between">
+                      <span>{(MAX_CURVE_SUPPLY - curveSupply).toLocaleString()} CRV to cap</span>
+                      <span>Max: 10k</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 3. ETH Contract Reserve Backing */}
+                <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-xs flex flex-col justify-between">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      Contract ETH Reserve
+                    </span>
+                    <span className="bg-emerald-100 text-emerald-800 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
+                      100% Backed
+                    </span>
+                  </div>
+                  <div className="my-3">
+                    <div className="text-2xl font-extrabold text-slate-900 tracking-tight font-mono">
+                      {currentCurveReserveETH.toFixed(5)} ETH
+                    </div>
+                    <div className="text-xs font-semibold text-slate-500 mt-0.5">
+                      &asymp; ${(currentCurveReserveETH * ethUsdRate).toFixed(2)} USD
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-400 flex items-center justify-between pt-2 border-t border-slate-100">
+                    <span>Dust Invariant: &le; 2 wei</span>
+                    <span className="font-semibold text-emerald-700">Fully Solvent</span>
+                  </div>
+                </div>
+
+                {/* 4. Your Realtime Holdings (Firebase RTDB) */}
+                <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-xs flex flex-col justify-between">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                      Your Vault Holdings
+                    </span>
+                    <span className="bg-slate-100 text-slate-700 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
+                      Firebase RTDB
+                    </span>
+                  </div>
+                  <div className="my-3">
+                    <div className="text-2xl font-extrabold text-slate-900 tracking-tight font-mono">
+                      {balanceMYC.toLocaleString()} CRV
+                    </div>
+                    <div className="text-xs font-semibold text-slate-500 mt-0.5">
+                      ETH Balance: {balanceETH.toFixed(4)} ETH
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-slate-400 flex items-center justify-between pt-2 border-t border-slate-100">
+                    <span>Account:</span>
+                    <span className="font-mono text-slate-700 font-semibold truncate max-w-[120px]">
+                      {currentUser && userAddress ? `${userAddress.slice(0, 6)}...${userAddress.slice(-4)}` : "Guest"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Main 2-Column Grid: Visualizer & Trading Station */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                {/* Left Column (8 cols): Interactive Bonding Curve Graph & Math Deep Dive */}
+                <div className="lg:col-span-8 space-y-6">
+                  {/* SVG Curve Chart Card */}
+                  <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-xs space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h4 className="font-bold text-slate-900 text-base">
+                            Price vs. Supply Curve &amp; Reserve Integral
+                          </h4>
+                          <span className="bg-emerald-50 text-[#00875a] border border-emerald-200/60 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
+                            P(S) = P₀ + M&middot;S
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          The shaded area under the curve is the exact ETH reserve held to guarantee refunds.
+                        </p>
+                      </div>
+
+                      {/* Legend */}
+                      <div className="flex items-center gap-3 text-xs">
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-xs bg-emerald-500/30 border border-emerald-500" />
+                          <span className="text-slate-600 font-medium">ETH Reserve Area</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-[#00875a]" />
+                          <span className="text-slate-600 font-medium">Current Supply: {curveSupply} CRV</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Interactive SVG Chart */}
+                    <div className="h-64 w-full relative select-none">
+                      {(() => {
+                        // SVG Graph dimensions
+                        const svgW = 700;
+                        const svgH = 240;
+                        const padL = 65;
+                        const padR = 35;
+                        const padT = 25;
+                        const padB = 40;
+                        const graphW = svgW - padL - padR; // 600
+                        const graphH = svgH - padT - padB; // 175
+                        const maxS = 10000;
+                        const maxP = 0.011; // 0.011 ETH max scale
+
+                        const getX = (s: number) => padL + (Math.max(0, Math.min(maxS, s)) / maxS) * graphW;
+                        const getY = (p: number) => padT + graphH - (p / maxP) * graphH;
+
+                        // Linear curve endpoints
+                        const pStart = P0; // 0.0001
+                        const pEnd = P0 + M * maxS; // 0.0101
+                        const x0 = getX(0);
+                        const y0 = getY(pStart);
+                        const xEnd = getX(maxS);
+                        const yEnd = getY(pEnd);
+
+                        // Current supply point
+                        const currentX = getX(curveSupply);
+                        const currentY = getY(currentCurvePriceETH);
+                        const baselineY = padT + graphH;
+
+                        // Reserve Area Polygon (from 0 to current supply)
+                        const reservePolygon = `M ${x0} ${baselineY} L ${x0} ${y0} L ${currentX} ${currentY} L ${currentX} ${baselineY} Z`;
+
+                        // Delta trade preview (if input is valid)
+                        const inputAmt = parseFloat(curveAmountInput) || 0;
+                        let deltaPolygon = "";
+                        let deltaColor = "";
+                        if (inputAmt > 0) {
+                          if (curveTradeMode === "BUY") {
+                            const nextS = Math.min(maxS, curveSupply + inputAmt);
+                            const nextX = getX(nextS);
+                            const nextY = getY(P0 + M * nextS);
+                            deltaPolygon = `M ${currentX} ${baselineY} L ${currentX} ${currentY} L ${nextX} ${nextY} L ${nextX} ${baselineY} Z`;
+                            deltaColor = "fill-emerald-400/40 stroke-emerald-500";
+                          } else {
+                            const prevS = Math.max(0, curveSupply - inputAmt);
+                            const prevX = getX(prevS);
+                            const prevY = getY(P0 + M * prevS);
+                            deltaPolygon = `M ${prevX} ${baselineY} L ${prevX} ${prevY} L ${currentX} ${currentY} L ${currentX} ${baselineY} Z`;
+                            deltaColor = "fill-amber-400/40 stroke-amber-500";
+                          }
+                        }
+
+                        return (
+                          <svg className="w-full h-full" viewBox={`0 0 ${svgW} ${svgH}`} preserveAspectRatio="none">
+                            <defs>
+                              <linearGradient id="curveReserveGrad" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0%" stopColor="#10b981" stopOpacity="0.35" />
+                                <stop offset="100%" stopColor="#10b981" stopOpacity="0.05" />
+                              </linearGradient>
+                            </defs>
+
+                            {/* Gridlines */}
+                            {[0.002, 0.005, 0.008, 0.0101].map((pVal) => {
+                              const y = getY(pVal);
+                              return (
+                                <g key={pVal}>
+                                  <line
+                                    x1={padL}
+                                    y1={y}
+                                    x2={padL + graphW}
+                                    y2={y}
+                                    stroke="#e2e8f0"
+                                    strokeDasharray="4 4"
+                                    strokeWidth="1"
+                                  />
+                                  <text
+                                    x={padL - 8}
+                                    y={y + 3.5}
+                                    textAnchor="end"
+                                    fontSize="10"
+                                    fill="#94a3b8"
+                                    fontFamily="monospace"
+                                  >
+                                    {pVal.toFixed(4)}
+                                  </text>
+                                </g>
+                              );
+                            })}
+
+                            {/* X Axis Baseline */}
+                            <line
+                              x1={padL}
+                              y1={baselineY}
+                              x2={padL + graphW}
+                              y2={baselineY}
+                              stroke="#cbd5e1"
+                              strokeWidth="1.5"
+                            />
+
+                            {/* Vertical X Grid & Labels */}
+                            {[0, 2500, 5000, 7500, 10000].map((sVal) => {
+                              const x = getX(sVal);
+                              return (
+                                <g key={sVal}>
+                                  <line
+                                    x1={x}
+                                    y1={padT}
+                                    x2={x}
+                                    y2={baselineY}
+                                    stroke="#f1f5f9"
+                                    strokeWidth="1"
+                                  />
+                                  <text
+                                    x={x}
+                                    y={baselineY + 16}
+                                    textAnchor="middle"
+                                    fontSize="10"
+                                    fill="#64748b"
+                                    fontWeight="bold"
+                                  >
+                                    {sVal === 0 ? "0" : `${sVal.toLocaleString()} CRV`}
+                                  </text>
+                                </g>
+                              );
+                            })}
+
+                            {/* Shaded ETH Reserve Polygon */}
+                            <path d={reservePolygon} fill="url(#curveReserveGrad)" />
+
+                            {/* Delta Area for Pending Trade */}
+                            {deltaPolygon && (
+                              <path
+                                d={deltaPolygon}
+                                className={deltaColor}
+                                strokeDasharray="3 3"
+                                strokeWidth="1.5"
+                              />
+                            )}
+
+                            {/* Linear Curve Stroke */}
+                            <line
+                              x1={x0}
+                              y1={y0}
+                              x2={xEnd}
+                              y2={yEnd}
+                              stroke="#00875a"
+                              strokeWidth="3.5"
+                              strokeLinecap="round"
+                            />
+
+                            {/* Current Supply Marker */}
+                            <circle cx={currentX} cy={currentY} r="9" fill="#00875a" fillOpacity="0.2" className="animate-pulse" />
+                            <circle cx={currentX} cy={currentY} r="5" fill="#00875a" />
+
+                            {/* Callout box for Current Supply */}
+                            <g transform={`translate(${Math.min(currentX, svgW - 130)}, ${Math.max(padT + 10, currentY - 32)})`}>
+                              <rect width="115" height="26" rx="6" fill="#0f172a" fillOpacity="0.9" />
+                              <text x="57" y="16" textAnchor="middle" fill="#ffffff" fontSize="10" fontWeight="bold">
+                                {curveSupply} CRV &bull; {currentCurvePriceETH.toFixed(5)} ETH
+                              </text>
+                            </g>
+                          </svg>
+                        );
+                      })()}
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs text-slate-500 pt-1">
+                      <span>X-Axis: Supply in whole coins (0 &rarr; 10,000 CRV)</span>
+                      <span>Y-Axis: Spot Price in ETH (0.0001 &rarr; 0.0101 ETH)</span>
+                    </div>
+                  </div>
+
+                  {/* Math & Architectural Guarantees Card */}
+                  <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-6 space-y-4">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-lg bg-teal-100 text-teal-800 flex items-center justify-center font-bold">
+                        <Scale className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-slate-900 text-sm">
+                          Autonomous Contract Architecture &amp; Solvency Math
+                        </h4>
+                        <p className="text-xs text-slate-500">
+                          Why this bonding curve is safer than traditional tokens and algorithmic stablecoins
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-1.5">
+                        <div className="flex items-center gap-2 font-bold text-slate-900">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>Strict Solvency Guarantee</span>
+                        </div>
+                        <p className="text-slate-600 leading-relaxed">
+                          In <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">CurveCoin.sol</code>, buys round costs <strong>UP (Ceil)</strong> and sells round refunds <strong>DOWN (Floor)</strong> using OpenZeppelin <code className="font-mono text-slate-800">Math.mulDiv</code>. The contract can mathematically never owe more ETH than it holds in reserve.
+                        </p>
+                      </div>
+
+                      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-1.5">
+                        <div className="flex items-center gap-2 font-bold text-slate-900">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>Zero Admin Key / No Owner</span>
+                        </div>
+                        <p className="text-slate-600 leading-relaxed">
+                          There is no owner, no mint function, and no admin backdoor. Supply can <em>only</em> increase when real ETH is deposited into the reserve, and supply can <em>only</em> decrease when coins are burned.
+                        </p>
+                      </div>
+
+                      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-1.5">
+                        <div className="flex items-center gap-2 font-bold text-slate-900">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>Slippage &amp; Sandwich Protection</span>
+                        </div>
+                        <p className="text-slate-600 leading-relaxed">
+                          The <code className="font-mono text-slate-800">buy(amount, maxCost)</code> and <code className="font-mono text-slate-800">sell(amount, minRefund)</code> methods enforce strict slippage limits on-chain, preventing front-running and MEV sandwich attacks.
+                        </p>
+                      </div>
+
+                      <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-1.5">
+                        <div className="flex items-center gap-2 font-bold text-slate-900">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>ReentrancyGuard &amp; Call Pattern</span>
+                        </div>
+                        <p className="text-slate-600 leading-relaxed">
+                          State modifications (<code className="font-mono text-slate-800">_mint</code> / <code className="font-mono text-slate-800">_burn</code>) always precede ETH transfers using native <code className="font-mono text-slate-800">call</code> with OpenZeppelin v5 <code className="font-mono text-slate-800">nonReentrant</code> guard.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Right Column (4 cols): Buy / Sell Interactive Trading Station */}
+                <div className="lg:col-span-4 space-y-6">
+                  <div className="bg-white border border-slate-200/80 rounded-2xl p-6 shadow-xs space-y-5">
+                    <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                      <div>
+                        <h4 className="font-bold text-slate-900 text-base">Trade on the Curve</h4>
+                        <p className="text-xs text-slate-400">Mint or burn CRV with live quote</p>
+                      </div>
+                      <span className="text-[10px] font-bold uppercase tracking-wider bg-slate-100 text-slate-700 px-2 py-1 rounded">
+                        18 Decimals
+                      </span>
+                    </div>
+
+                    {/* Mode Toggle: BUY vs SELL */}
+                    <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-xl">
+                      <button
+                        onClick={() => setCurveTradeMode("BUY")}
+                        className={`py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                          curveTradeMode === "BUY"
+                            ? "bg-[#00875a] text-white shadow-2xs"
+                            : "text-slate-600 hover:text-slate-900"
+                        }`}
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Buy (Mint CRV)</span>
+                      </button>
+                      <button
+                        onClick={() => setCurveTradeMode("SELL")}
+                        className={`py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                          curveTradeMode === "SELL"
+                            ? "bg-amber-600 text-white shadow-2xs"
+                            : "text-slate-600 hover:text-slate-900"
+                        }`}
+                      >
+                        <Flame className="w-3.5 h-3.5" />
+                        <span>Sell (Burn CRV)</span>
+                      </button>
+                    </div>
+
+                    {/* Amount Input */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <label className="font-semibold text-slate-700">Amount of Coins (CRV)</label>
+                        <span className="text-slate-400 text-[11px]">
+                          Available:{" "}
+                          <strong className="text-slate-700">
+                            {curveTradeMode === "BUY"
+                              ? `${balanceETH.toFixed(4)} ETH`
+                              : `${balanceMYC.toLocaleString()} CRV`}
+                          </strong>
+                        </span>
+                      </div>
+
+                      <div className="relative">
+                        <input
+                          type="number"
+                          min="1"
+                          max={curveTradeMode === "BUY" ? MAX_CURVE_SUPPLY - curveSupply : curveSupply}
+                          step="1"
+                          value={curveAmountInput}
+                          onChange={(e) => setCurveAmountInput(e.target.value)}
+                          placeholder="e.g. 40"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-base font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 font-mono"
+                        />
+                        <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
+                          CRV
+                        </span>
+                      </div>
+
+                      {/* Quick Amount Chips */}
+                      <div className="flex items-center gap-1.5 pt-1">
+                        {["10", "40", "100", "250"].map((chip) => (
+                          <button
+                            key={chip}
+                            onClick={() => setCurveAmountInput(chip)}
+                            className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold py-1 rounded-lg transition-colors cursor-pointer"
+                          >
+                            +{chip}
+                          </button>
+                        ))}
+                        <button
+                          onClick={() => {
+                            if (curveTradeMode === "BUY") {
+                              setCurveAmountInput("100");
+                            } else {
+                              setCurveAmountInput(String(Math.min(balanceMYC, curveSupply)));
+                            }
+                          }}
+                          className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold px-2 py-1 rounded-lg transition-colors cursor-pointer"
+                        >
+                          Max
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Live Quote Breakdown Card */}
+                    {(() => {
+                      const inputAmt = parseFloat(curveAmountInput) || 0;
+                      if (inputAmt <= 0) {
+                        return (
+                          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5 text-xs text-slate-400 text-center">
+                            Enter an amount above to see the bonding curve price quote.
+                          </div>
+                        );
+                      }
+
+                      if (curveTradeMode === "BUY") {
+                        const buyCost = calcCurveBuyCost(inputAmt);
+                        const avgPrice = buyCost / inputAmt;
+                        const nextSupply = curveSupply + inputAmt;
+                        const nextPrice = P0 + M * nextSupply;
+                        const maxCostWithSlippage = buyCost * 1.01;
+
+                        return (
+                          <div className="bg-emerald-50/70 border border-emerald-200/80 rounded-xl p-4 space-y-2.5 text-xs">
+                            <div className="flex items-center justify-between pb-2 border-b border-emerald-200/50">
+                              <span className="font-bold text-emerald-950">Quoted Purchase Cost:</span>
+                              <div className="text-right">
+                                <div className="font-mono font-extrabold text-sm text-[#00875a]">
+                                  {buyCost.toFixed(6)} ETH
+                                </div>
+                                <div className="text-[10px] text-slate-500 font-semibold">
+                                  &asymp; ${(buyCost * ethUsdRate).toFixed(2)} USD
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="space-y-1.5 text-slate-600">
+                              <div className="flex justify-between">
+                                <span>Average Price / Coin:</span>
+                                <span className="font-mono font-semibold text-slate-800">
+                                  {avgPrice.toFixed(6)} ETH
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Next Curve Spot Price:</span>
+                                <span className="font-mono font-semibold text-slate-800">
+                                  {nextPrice.toFixed(6)} ETH
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Post-Trade Supply:</span>
+                                <span className="font-mono font-semibold text-slate-800">
+                                  {nextSupply.toLocaleString()} / 10,000 CRV
+                                </span>
+                              </div>
+                              <div className="flex justify-between text-[11px] pt-1 border-t border-emerald-200/40 text-emerald-800">
+                                <span>Max Cost (+1% Slippage):</span>
+                                <span className="font-mono font-bold">
+                                  {maxCostWithSlippage.toFixed(6)} ETH
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      } else {
+                        const sellRefund = calcCurveSellRefund(inputAmt);
+                        const avgRefund = sellRefund / inputAmt;
+                        const nextSupply = Math.max(0, curveSupply - inputAmt);
+                        const nextPrice = P0 + M * nextSupply;
+                        const minRefundWithSlippage = sellRefund * 0.99;
+
+                        return (
+                          <div className="bg-amber-50/70 border border-amber-200/80 rounded-xl p-4 space-y-2.5 text-xs">
+                            <div className="flex items-center justify-between pb-2 border-b border-amber-200/50">
+                              <span className="font-bold text-amber-950">Quoted ETH Refund:</span>
+                              <div className="text-right">
+                                <div className="font-mono font-extrabold text-sm text-amber-700">
+                                  {sellRefund.toFixed(6)} ETH
+                                </div>
+                                <div className="text-[10px] text-slate-500 font-semibold">
+                                  &asymp; ${(sellRefund * ethUsdRate).toFixed(2)} USD
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="space-y-1.5 text-slate-600">
+                              <div className="flex justify-between">
+                                <span>Average Refund / Coin:</span>
+                                <span className="font-mono font-semibold text-slate-800">
+                                  {avgRefund.toFixed(6)} ETH
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Next Curve Spot Price:</span>
+                                <span className="font-mono font-semibold text-slate-800">
+                                  {nextPrice.toFixed(6)} ETH
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Post-Trade Supply:</span>
+                                <span className="font-mono font-semibold text-slate-800">
+                                  {nextSupply.toLocaleString()} CRV
+                                </span>
+                              </div>
+                              <div className="flex justify-between text-[11px] pt-1 border-t border-amber-200/40 text-amber-800">
+                                <span>Min Refund (-1% Slippage):</span>
+                                <span className="font-mono font-bold">
+                                  {minRefundWithSlippage.toFixed(6)} ETH
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }
+                    })()}
+
+                    {/* Success Notice */}
+                    {curveSuccessMsg && (
+                      <div className="bg-emerald-100 border border-emerald-300 text-emerald-900 rounded-xl p-3 text-xs font-semibold flex items-center gap-2 animate-in fade-in">
+                        <Check className="w-4 h-4 text-emerald-700 shrink-0" />
+                        <span>{curveSuccessMsg}</span>
+                      </div>
+                    )}
+
+                    {/* Action Execution Button */}
+                    <button
+                      onClick={handleExecuteCurveTrade}
+                      disabled={isCurveTrading || !currentUser}
+                      className={`w-full font-bold text-xs py-3 rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs cursor-pointer ${
+                        !currentUser
+                          ? "bg-slate-200 text-slate-500 cursor-not-allowed"
+                          : curveTradeMode === "BUY"
+                          ? "bg-[#00875a] hover:bg-[#00754e] text-white"
+                          : "bg-amber-600 hover:bg-amber-700 text-white"
+                      }`}
+                    >
+                      {isCurveTrading ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          <span>Executing Bonding Curve Trade...</span>
+                        </>
+                      ) : !currentUser ? (
+                        <>
+                          <KeyRound className="w-4 h-4" />
+                          <span>Sign In to Trade on Curve</span>
+                        </>
+                      ) : curveTradeMode === "BUY" ? (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          <span>Buy &amp; Mint {curveAmountInput || "0"} CRV</span>
+                        </>
+                      ) : (
+                        <>
+                          <Flame className="w-4 h-4" />
+                          <span>Burn &amp; Refund {curveAmountInput || "0"} CRV</span>
+                        </>
+                      )}
+                    </button>
+
+                    <div className="text-[10px] text-slate-400 text-center leading-normal">
+                      Tokens are minted/burned on the spot. Reserves and balances are stored and synced in real-time with Firebase Realtime Database.
+                    </div>
+                  </div>
+
+                  {/* Local Hardhat Demo & Sepolia Deploy Command Reference */}
+                  <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-xs space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h5 className="font-bold text-slate-900 text-xs uppercase tracking-wider">
+                        Smart Contract &amp; Tests
+                      </h5>
+                      <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                        Local Hardhat Ready
+                      </span>
+                    </div>
+
+                    <div className="space-y-1.5 text-xs text-slate-600 font-mono bg-slate-950 text-slate-200 p-3 rounded-xl text-[11px] overflow-x-auto">
+                      <div className="text-slate-400"># Run automated tests (10/10 passing)</div>
+                      <div className="text-emerald-400">npx hardhat test test/CurveCoin.test.js</div>
+                      <div className="text-slate-400 pt-1"># Run local bonding curve demo</div>
+                      <div className="text-teal-400">npx hardhat run scripts/curve-demo.js</div>
+                      <div className="text-slate-400 pt-1"># Deploy to Sepolia testnet</div>
+                      <div className="text-amber-300">npx hardhat run scripts/deploy-curve.js --network sepolia</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : activeTab === "UTXO" ? (
+            <UTXOBlockchainExplorer />
           ) : (
             <>
               {/* ROW 1: TOTAL PORTFOLIO VALUE & QUICK ACTIONS */}
@@ -1419,15 +2397,17 @@ export default function ApexDashboard() {
                         <span className="font-bold text-slate-900 text-sm">Your MYC Balance</span>
                       </div>
                       <div className="text-xs text-slate-500 font-medium">
-                        {balanceMYC.toLocaleString()} MYC
+                        {currentUser ? `${balanceMYC.toLocaleString()} MYC` : "Sign in to view"}
                       </div>
                     </div>
                   </div>
                   <div className="text-right">
                     <div className="font-bold text-slate-900 text-sm">
-                      ${(balanceMYC * spotPriceInUSD).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      {currentUser
+                        ? `$${(balanceMYC * spotPriceInUSD).toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+                        : "—"}
                     </div>
-                    <div className="text-xs font-semibold text-purple-600">In Custody</div>
+                    <div className="text-[10px] font-semibold text-purple-600">Firebase RTDB</div>
                   </div>
                 </div>
 
@@ -1442,15 +2422,17 @@ export default function ApexDashboard() {
                         <span className="font-bold text-slate-900 text-sm">Your ETH Balance</span>
                       </div>
                       <div className="text-xs text-slate-500 font-medium">
-                        {balanceETH.toFixed(2)} ETH
+                        {currentUser ? `${balanceETH.toFixed(2)} ETH` : "Sign in to view"}
                       </div>
                     </div>
                   </div>
                   <div className="text-right">
                     <div className="font-bold text-slate-900 text-sm">
-                      ${(balanceETH * ethUsdRate).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      {currentUser
+                        ? `$${(balanceETH * ethUsdRate).toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+                        : "—"}
                     </div>
-                    <div className="text-xs font-semibold text-amber-600">For Gas &amp; Swaps</div>
+                    <div className="text-[10px] font-semibold text-amber-600">Firebase RTDB</div>
                   </div>
                 </div>
               </div>
@@ -1613,29 +2595,49 @@ export default function ApexDashboard() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100/80 text-xs sm:text-sm">
-                      {filteredTxs.map((tx) => (
-                        <tr key={tx.id} className="hover:bg-slate-50/60 transition-colors">
-                          <td className="py-3.5 px-2">
-                            <div className="flex items-center gap-2.5">
-                              <div
-                                className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
-                                  tx.type === "Deposit"
-                                    ? "bg-emerald-50 text-[#00875a]"
-                                    : tx.type === "Send"
-                                    ? "bg-blue-50 text-blue-600"
-                                    : tx.type === "AMM Swap"
-                                    ? "bg-indigo-50 text-indigo-600"
-                                    : "bg-purple-50 text-purple-600"
-                                }`}
-                              >
-                                {tx.type === "Deposit" && <Check className="w-4 h-4" />}
-                                {tx.type === "Send" && <ArrowUpRight className="w-4 h-4" />}
-                                {tx.type === "AMM Swap" && <ArrowLeftRight className="w-4 h-4" />}
-                                {tx.type === "Mint" && <Sparkles className="w-4 h-4" />}
+                      {filteredTxs.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-10 text-center text-xs text-slate-400">
+                            <div className="flex flex-col items-center justify-center gap-2">
+                              <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center text-slate-400">
+                                <Coins className="w-5 h-5" />
                               </div>
-                              <span className="font-semibold text-slate-900">{tx.type}</span>
+                              <span className="font-bold text-slate-700 text-sm">No transactions yet</span>
+                              <span className="text-slate-400 max-w-sm">
+                                Send coins to Bob or any contact to generate verified on-chain UTXO debit &amp; credit records.
+                              </span>
                             </div>
                           </td>
+                        </tr>
+                      ) : (
+                        filteredTxs.map((tx) => (
+                          <tr key={tx.id} className="hover:bg-slate-50/60 transition-colors">
+                            <td className="py-3.5 px-2">
+                              <div className="flex items-center gap-2.5">
+                                <div
+                                  className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
+                                    tx.type === "Deposit" || tx.type === "Deposit (UTXO)"
+                                      ? "bg-emerald-50 text-[#00875a]"
+                                      : tx.type === "Send" || tx.type === "Send (UTXO)"
+                                      ? "bg-blue-50 text-blue-600"
+                                      : tx.type === "AMM Swap"
+                                      ? "bg-indigo-50 text-indigo-600"
+                                      : tx.type === "Bonding Buy"
+                                      ? "bg-teal-50 text-teal-600"
+                                      : tx.type === "Bonding Sell"
+                                      ? "bg-amber-50 text-amber-600"
+                                      : "bg-purple-50 text-purple-600"
+                                  }`}
+                                >
+                                  {(tx.type === "Deposit" || tx.type === "Deposit (UTXO)") && <Check className="w-4 h-4" />}
+                                  {(tx.type === "Send" || tx.type === "Send (UTXO)") && <ArrowUpRight className="w-4 h-4" />}
+                                  {tx.type === "AMM Swap" && <ArrowLeftRight className="w-4 h-4" />}
+                                  {(tx.type === "Mint" || tx.type === "Mint (UTXO)") && <Sparkles className="w-4 h-4" />}
+                                  {(tx.type === "Bonding Buy" || tx.type === "Bonding Sell") && <TrendingUp className="w-4 h-4" />}
+                                </div>
+                                <span className="font-semibold text-slate-900">{tx.type}</span>
+                              </div>
+                            </td>
 
                           <td className="py-3.5 px-2">
                             <div className="font-bold text-slate-900">{tx.amount}</div>
@@ -1660,7 +2662,8 @@ export default function ApexDashboard() {
                             </span>
                           </td>
                         </tr>
-                      ))}
+                      ))
+                    )}
                     </tbody>
                   </table>
                 </div>

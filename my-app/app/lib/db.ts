@@ -9,10 +9,10 @@ import {
   limit,
   onSnapshot,
   serverTimestamp,
-  getDocs,
   deleteDoc,
 } from "firebase/firestore";
-import { db } from "./firebase";
+import { ref, set, get, onValue, update, DatabaseReference } from "firebase/database";
+import { db, rtdb } from "./firebase";
 import { User as FirebaseUser } from "firebase/auth";
 
 export interface UserProfile {
@@ -28,6 +28,17 @@ export interface UserProfile {
   updatedAt?: unknown;
 }
 
+export interface WalletHoldings {
+  uid: string;
+  permanentAddress: string;
+  mycBalance: number;
+  ethBalance: number;
+  organization: string;
+  displayName?: string;
+  email?: string;
+  updatedAt?: number;
+}
+
 export interface KnownAccount {
   id: string;
   name: string;
@@ -36,6 +47,8 @@ export interface KnownAccount {
   email?: string;
   role?: string;
   avatarColor: string;
+  mycBalance?: number;
+  ethBalance?: number;
   updatedAt?: unknown;
 }
 
@@ -63,6 +76,8 @@ export const DEFAULT_KNOWN_ACCOUNTS: KnownAccount[] = [
     email: "bob.trader@apexcustody.com",
     role: "Senior OTC Liquidity Provider",
     avatarColor: "bg-blue-600",
+    mycBalance: 0, // Starts at 0, credited on UTXO payment
+    ethBalance: 5.0,
   },
   {
     id: "acc-alice",
@@ -72,6 +87,8 @@ export const DEFAULT_KNOWN_ACCOUNTS: KnownAccount[] = [
     email: "alice@consensuscap.io",
     role: "Treasury Asset Manager",
     avatarColor: "bg-purple-600",
+    mycBalance: 0, // Starts at 0, credited on UTXO payment
+    ethBalance: 5.0,
   },
   {
     id: "acc-vault",
@@ -81,8 +98,111 @@ export const DEFAULT_KNOWN_ACCOUNTS: KnownAccount[] = [
     email: "vault02@apexcustody.com",
     role: "Multi-Sig Cold Custodian",
     avatarColor: "bg-emerald-600",
+    mycBalance: 0,
+    ethBalance: 10.0,
   },
 ];
+
+// ============================================================================
+// FIREBASE REALTIME DATABASE (RTDB) - WALLET HOLDINGS & ADDRESS STORAGE
+// ============================================================================
+
+/**
+ * Subscribes to wallet address and token holdings directly from Firebase Realtime Database.
+ * If the wallet doesn't exist yet in Realtime Database, it initializes it.
+ */
+export function subscribeWalletHoldingsFromRTDB(
+  uid: string,
+  permanentAddress: string,
+  user: FirebaseUser | null,
+  initialOrg: string,
+  callback: (holdings: WalletHoldings) => void
+): () => void {
+  try {
+    const walletRef = ref(rtdb, `wallets/${uid}`);
+    
+    const unsubscribe = onValue(
+      walletRef,
+      async (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.val() as WalletHoldings;
+          callback(data);
+        } else if (permanentAddress) {
+          // Initialize new wallet in Firebase Realtime Database
+          const newWallet: WalletHoldings = {
+            uid,
+            permanentAddress,
+            mycBalance: 0, // Zero initial mock balance: must be minted/received via UTXO
+            ethBalance: 5.0,
+            organization: initialOrg || "Apex Institutional Custody",
+            displayName: user?.displayName || user?.email?.split("@")[0] || "Trader",
+            email: user?.email || "",
+            updatedAt: Date.now(),
+          };
+          try {
+            await set(walletRef, newWallet);
+            callback(newWallet);
+          } catch (writeErr) {
+            console.warn("RTDB initial set warning (using memory):", writeErr);
+            callback(newWallet);
+          }
+        }
+      },
+      (error) => {
+        console.warn("RTDB subscribeWalletHoldings error (falling back to Firestore):", error);
+      }
+    );
+
+    return () => unsubscribe();
+  } catch (error) {
+    console.warn("RTDB subscription failed:", error);
+    return () => {};
+  }
+}
+
+/**
+ * Updates wallet holdings (MYC & ETH balances) in Firebase Realtime Database
+ */
+export async function updateWalletHoldingsInRTDB(
+  uid: string,
+  mycBalance: number,
+  ethBalance: number,
+  permanentAddress?: string
+): Promise<void> {
+  try {
+    const walletRef = ref(rtdb, `wallets/${uid}`);
+    const updates: Partial<WalletHoldings> = {
+      mycBalance,
+      ethBalance,
+      updatedAt: Date.now(),
+    };
+    if (permanentAddress) {
+      updates.permanentAddress = permanentAddress;
+    }
+    await update(walletRef, updates);
+  } catch (error) {
+    console.warn("Firebase RTDB updateWalletHoldings error:", error);
+  }
+}
+
+/**
+ * Updates user organization in Firebase Realtime Database
+ */
+export async function updateWalletOrgInRTDB(uid: string, organization: string): Promise<void> {
+  try {
+    const walletRef = ref(rtdb, `wallets/${uid}`);
+    await update(walletRef, {
+      organization,
+      updatedAt: Date.now(),
+    });
+  } catch (error) {
+    console.warn("Firebase RTDB updateWalletOrg error:", error);
+  }
+}
+
+// ============================================================================
+// FIRESTORE DATABASE - COUNTERPARTIES (BOB), DIRECTORY & TRANSACTION LEDGER
+// ============================================================================
 
 /**
  * Seeds default accounts (Bob, Alice, Cold Vault) into Firestore `accounts` collection if not present
@@ -107,7 +227,6 @@ export async function seedDefaultAccountsToFirebase(): Promise<void> {
 
 /**
  * Real-time listener for Firestore `accounts` collection.
- * Automatically seeds Bob and counterparties if empty, and notifies callback with updated array.
  */
 export function subscribeToAccounts(
   callback: (accounts: KnownAccount[]) => void
@@ -118,7 +237,6 @@ export function subscribeToAccounts(
       accountsCol,
       async (snapshot) => {
         if (snapshot.empty) {
-          // Auto-seed default accounts (Bob, Alice, Vault) into Firestore
           await seedDefaultAccountsToFirebase();
           callback(DEFAULT_KNOWN_ACCOUNTS);
           return;
@@ -172,20 +290,7 @@ export async function saveAccountToFirebase(account: KnownAccount): Promise<void
 }
 
 /**
- * Deletes an account from Firestore
- */
-export async function deleteAccountFromFirebase(id: string): Promise<void> {
-  try {
-    const docRef = doc(db, "accounts", id);
-    await deleteDoc(docRef);
-  } catch (error) {
-    console.error("Firestore deleteAccount error:", error);
-    throw error;
-  }
-}
-
-/**
- * Stores or updates user account info and permanent address in Firestore `users/{uid}` and `accounts/{uid}`
+ * Stores or updates user account info and permanent address in Firestore `users/{uid}`
  */
 export async function syncUserProfileToFirebase(
   user: FirebaseUser,
@@ -209,11 +314,9 @@ export async function syncUserProfileToFirebase(
   };
 
   try {
-    // 1. Update user profile document in Firestore
     const userRef = doc(db, "users", user.uid);
     await setDoc(userRef, profile, { merge: true });
 
-    // 2. Also register the user as an active account in the directory
     const accountRef = doc(db, "accounts", user.uid);
     await setDoc(
       accountRef,
@@ -234,37 +337,6 @@ export async function syncUserProfileToFirebase(
   }
 
   return profile;
-}
-
-/**
- * Real-time listener for user profile in Firestore `users/{uid}`
- */
-export function subscribeToUserProfile(
-  uid: string,
-  callback: (profile: UserProfile | null) => void
-): () => void {
-  try {
-    const userRef = doc(db, "users", uid);
-    const unsubscribe = onSnapshot(
-      userRef,
-      (snap) => {
-        if (snap.exists()) {
-          callback(snap.data() as UserProfile);
-        } else {
-          callback(null);
-        }
-      },
-      (error) => {
-        console.warn("Firestore subscribeToUserProfile error:", error);
-        callback(null);
-      }
-    );
-    return unsubscribe;
-  } catch (error) {
-    console.warn("Firestore user profile subscription failed:", error);
-    callback(null);
-    return () => {};
-  }
 }
 
 /**
@@ -327,8 +399,6 @@ export function subscribeToTransactions(
         callback(list);
       },
       (error) => {
-        // Fallback query without orderBy if index is being built
-        console.warn("Firestore ordered query failed, trying simple query:", error);
         const fallbackSub = onSnapshot(txCollection, (snap) => {
           const list: FirestoreTransaction[] = [];
           snap.forEach((d) => {
