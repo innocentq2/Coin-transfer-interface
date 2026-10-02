@@ -1,0 +1,7 @@
+**/node_modules/
+**/wallets.json
+**/deployed.json
+**/cache/
+**/artifacts/
+**/.next/
+.env*
