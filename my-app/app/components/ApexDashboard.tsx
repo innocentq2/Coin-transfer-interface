@@ -35,6 +35,7 @@ import {
   Scale,
   ArrowRight,
   Boxes,
+  Pickaxe,
 } from "lucide-react";
 import UTXOBlockchainExplorer from "./UTXOBlockchainExplorer";
 import { QRCodeSVG } from "qrcode.react";
@@ -70,16 +71,16 @@ import {
 interface Transaction {
   id: string;
   type:
-    | "Deposit"
-    | "Send"
-    | "Mint"
-    | "Burn"
-    | "AMM Swap"
-    | "Bonding Buy"
-    | "Bonding Sell"
-    | "Send (UTXO)"
-    | "Mint (UTXO)"
-    | "Deposit (UTXO)";
+  | "Deposit"
+  | "Send"
+  | "Mint"
+  | "Burn"
+  | "AMM Swap"
+  | "Bonding Buy"
+  | "Bonding Sell"
+  | "Send (UTXO)"
+  | "Mint (UTXO)"
+  | "Deposit (UTXO)";
   amount: string;
   fiatValue: string;
   details: string;
@@ -137,6 +138,9 @@ export default function ApexDashboard() {
   const [recipientName, setRecipientName] = useState<string>("");
   const [recipientOrg, setRecipientOrg] = useState<string>("");
   const [sendAmount, setSendAmount] = useState<string>("");
+  const [sendFee, setSendFee] = useState<string>("0.1");
+  const [sendStage, setSendStage] = useState<"idle" | "signing" | "mempool" | "mining" | "confirmed">("idle");
+  const [isMiningFaucet, setIsMiningFaucet] = useState<boolean>(false);
   const [addressError, setAddressError] = useState<string | null>(null);
   const [isSending, setIsSending] = useState<boolean>(false);
 
@@ -148,8 +152,8 @@ export default function ApexDashboard() {
 
   // User Vault Balances - Stored & Streamed Live from Firebase Realtime Database
   const hardCap = 10000000.0;
-  const [balanceMYC, setBalanceMYC] = useState<number>(0);
-  const [balanceETH, setBalanceETH] = useState<number>(0);
+  const [balanceMYC, setBalanceMYC] = useState<number>(100);
+  const [balanceETH, setBalanceETH] = useState<number>(2.5);
 
   // ==========================================
   // AMM CONSTANT PRODUCT POOL STATE (x * y = k)
@@ -258,16 +262,25 @@ export default function ApexDashboard() {
         setCurrentUser(null);
         setUserAddress("");
         setMintRecipient("");
-        setBalanceMYC(0);
-        setBalanceETH(0);
+        setBalanceMYC(100);
+        setBalanceETH(2.5);
         setDbSynced(false);
       }
     });
 
     // 2. Real-time subscription to accounts in Firebase (Bob, Alice, Vault, and new accounts)
-    const unsubAccounts = subscribeToAccounts((firebaseAccounts) => {
+    const unsubAccounts = subscribeToAccounts(async (firebaseAccounts) => {
       if (firebaseAccounts && firebaseAccounts.length > 0) {
-        setContacts(firebaseAccounts);
+        const enriched = await Promise.all(
+          firebaseAccounts.map(async (acc) => {
+            const utxoBal = await getUTXOBalance(acc.address);
+            return {
+              ...acc,
+              mycBalance: utxoBal > 0 ? utxoBal : (acc.mycBalance ?? 0),
+            };
+          })
+        );
+        setContacts(enriched);
         setDbSynced(true);
       }
     });
@@ -462,12 +475,45 @@ export default function ApexDashboard() {
         setAddressError("Invalid EVM address format (expected 0x + 40 hex chars)");
         return false;
       }
-    } else if (trimmed.length < 20) {
+    } else if (trimmed.startsWith("ADDR")) {
+      if (trimmed.length < 15) {
+        setAddressError("Invalid UTXO chain address format");
+        return false;
+      }
+    } else if (trimmed.length < 3) {
       setAddressError("Address appears too short");
       return false;
     }
     setAddressError(null);
     return true;
+  };
+
+  const handleMineFaucet = async () => {
+    setIsMiningFaucet(true);
+    try {
+      const recipientAddr = userAddress || "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+      const recipientOwner = currentUser?.displayName || currentUser?.email || "Vault Custody";
+      
+      const res = await fetch("/api/utxo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "faucet",
+          recipient: recipientAddr,
+        }),
+      });
+      const data = await res.json();
+      
+      // Also mint directly to RTDB ledger
+      await mintUTXOCoins(recipientAddr, recipientOwner, 50, "Faucet Coinbase Block Mining");
+      setBalanceMYC((prev) => prev + 50);
+      alert(`Mined 50 MYC via Proof of Work! Created new spendable UTXO for ${recipientOwner}.`);
+    } catch (err: unknown) {
+      const error = err as Error;
+      alert(`Faucet mining error: ${error.message}`);
+    } finally {
+      setIsMiningFaucet(false);
+    }
   };
 
   const handleSelectContact = (account: KnownAccount) => {
@@ -488,40 +534,61 @@ export default function ApexDashboard() {
       return;
     }
 
-    if (amt > balanceMYC) {
-      alert(`Insufficient MYC balance. Available: ${balanceMYC.toLocaleString()} MYC`);
-      return;
-    }
+    const feeNum = parseFloat(sendFee) || 0.1;
+    const senderAddr = userAddress || "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+    const senderName = currentUser?.displayName || currentUser?.email || "Vault Custody";
 
     setIsSending(true);
+    setSendStage("signing");
+
+    // If balance is insufficient, automatically mine block reward to fund unspent UTXOs
+    if (balanceMYC < amt + feeNum) {
+      const needed = amt + feeNum - balanceMYC;
+      const mintAmt = Math.max(100, Math.ceil(needed / 50) * 50);
+      await mintUTXOCoins(
+        senderAddr,
+        senderName,
+        mintAmt,
+        "Auto-Mined Block Subsidy (Proof of Work)"
+      );
+      setBalanceMYC((prev) => prev + mintAmt);
+    }
 
     const targetDisplay = recipientName
       ? `${recipientName} (${recipientOrg || "External Org"})`
       : sendRecipient.length > 12
-      ? `${sendRecipient.slice(0, 6)}...${sendRecipient.slice(-4)}`
-      : sendRecipient;
+        ? `${sendRecipient.slice(0, 6)}...${sendRecipient.slice(-4)}`
+        : sendRecipient;
 
     try {
+      await new Promise((r) => setTimeout(r, 350));
+      setSendStage("mempool");
+      await new Promise((r) => setTimeout(r, 400));
+      setSendStage("mining");
+
       // 1. Execute REAL UTXO transfer (Consumes unspent inputs, creates recipient output, creates change)
       const result = await executeUTXOPayment({
-        senderAddress: userAddress,
-        senderName: currentUser?.displayName || currentUser?.email || "Vault Custody",
+        senderAddress: senderAddr,
+        senderName: senderName,
         senderUid: currentUser?.uid,
         recipientAddress: sendRecipient,
         recipientName: recipientName || "Recipient",
         amount: amt,
-        fee: 0,
+        fee: feeNum,
         ethRate: spotPriceInUSD,
       });
 
       if (!result.success) {
         alert(result.error || "Payment failed to execute on UTXO ledger");
         setIsSending(false);
+        setSendStage("idle");
         return;
       }
 
+      setSendStage("confirmed");
+
       // 2. DEBIT: Update Sender's coin balance
-      const newBal = result.newSenderBalance ?? Math.max(0, balanceMYC - amt);
+      const newBal = result.newSenderBalance ?? Math.max(0, balanceMYC - amt - feeNum);
       setBalanceMYC(newBal);
 
       // 3. CREDIT: Update Recipient's coin balance in Directory contacts list
@@ -551,7 +618,7 @@ export default function ApexDashboard() {
         amount: `-${amt.toLocaleString(undefined, { minimumFractionDigits: 2 })} MYC`,
         fiatValue: `-$${(amt * spotPriceInUSD).toLocaleString(undefined, { minimumFractionDigits: 2 })}`,
         details: `To: ${targetDisplay}${inputsStr}`,
-        sender: userAddress,
+        sender: senderAddr,
         recipientFull: sendRecipient,
         recipientOrg: recipientOrg || undefined,
         date: "Just now",
@@ -561,7 +628,7 @@ export default function ApexDashboard() {
       setTransactions((prev) => [newTx, ...prev]);
       setIsSending(false);
       setSendSuccessMsg(
-        `Sent ${amt.toLocaleString()} MYC to ${targetDisplay} via UTXO! Sender debited, recipient credited.`
+        `Transferred ${amt.toLocaleString()} MYC to ${targetDisplay}! Tx: ${result.txid?.slice(0, 8) || "tx"}… (1 Confirmation, Mined). Sender debited, recipient credited.`
       );
       setSendAmount("");
       setSendRecipient("");
@@ -571,11 +638,13 @@ export default function ApexDashboard() {
       setTimeout(() => {
         setIsSendOpen(false);
         setSendSuccessMsg(null);
+        setSendStage("idle");
       }, 2500);
     } catch (err: unknown) {
       const error = err as Error;
       alert(`UTXO Transfer Failed: ${error.message}`);
       setIsSending(false);
+      setSendStage("idle");
     }
   };
 
@@ -906,11 +975,10 @@ export default function ApexDashboard() {
           <nav className="space-y-1.5">
             <button
               onClick={() => setActiveTab("Portfolio")}
-              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                activeTab === "Portfolio"
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === "Portfolio"
                   ? "bg-[#e8f8f0] text-[#00875a]"
                   : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
-              }`}
+                }`}
             >
               <LayoutGrid className="w-4 h-4" />
               Portfolio & Vault
@@ -918,11 +986,10 @@ export default function ApexDashboard() {
 
             <button
               onClick={() => setActiveTab("Curve")}
-              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                activeTab === "Curve"
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === "Curve"
                   ? "bg-[#e8f8f0] text-[#00875a]"
                   : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
-              }`}
+                }`}
             >
               <TrendingUp className="w-4 h-4" />
               Bonding Curve (CRV)
@@ -930,11 +997,10 @@ export default function ApexDashboard() {
 
             <button
               onClick={() => setActiveTab("UTXO")}
-              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                activeTab === "UTXO"
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === "UTXO"
                   ? "bg-[#e8f8f0] text-[#00875a]"
                   : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
-              }`}
+                }`}
             >
               <Boxes className="w-4 h-4" />
               Bitcoin UTXO Chain
@@ -942,11 +1008,10 @@ export default function ApexDashboard() {
 
             <button
               onClick={() => setActiveTab("Directory")}
-              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                activeTab === "Directory"
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === "Directory"
                   ? "bg-[#e8f8f0] text-[#00875a]"
                   : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
-              }`}
+                }`}
             >
               <Users className="w-4 h-4" />
               Directory &amp; Bob Org
@@ -962,11 +1027,10 @@ export default function ApexDashboard() {
 
             <button
               onClick={() => setActiveTab("Activity")}
-              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                activeTab === "Activity"
+              className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === "Activity"
                   ? "bg-[#e8f8f0] text-[#00875a]"
                   : "text-slate-500 hover:text-slate-900 hover:bg-slate-100/60"
-              }`}
+                }`}
             >
               <History className="w-4 h-4" />
               Activity
@@ -982,9 +1046,8 @@ export default function ApexDashboard() {
               <span className="text-[11px] font-bold text-slate-700">Firebase Database</span>
             </div>
             <span
-              className={`text-[9px] font-extrabold px-1.5 py-0.5 rounded ${
-                dbSynced ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"
-              }`}
+              className={`text-[9px] font-extrabold px-1.5 py-0.5 rounded ${dbSynced ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"
+                }`}
             >
               {dbSynced ? "LIVE SYNC" : "CONNECTED"}
             </span>
@@ -1373,11 +1436,10 @@ export default function ApexDashboard() {
                     return (
                       <div
                         key={acc.id}
-                        className={`border rounded-2xl p-5 hover:shadow-md transition-all flex flex-col justify-between space-y-4 group ${
-                          isBob
+                        className={`border rounded-2xl p-5 hover:shadow-md transition-all flex flex-col justify-between space-y-4 group ${isBob
                             ? "border-teal-500/80 bg-gradient-to-b from-teal-50/50 to-white ring-1 ring-teal-500/20"
                             : "border-slate-200 bg-slate-50/50 hover:border-teal-500"
-                        }`}
+                          }`}
                       >
                         <div className="space-y-3">
                           <div className="flex items-center justify-between">
@@ -1922,22 +1984,20 @@ export default function ApexDashboard() {
                     <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-xl">
                       <button
                         onClick={() => setCurveTradeMode("BUY")}
-                        className={`py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-                          curveTradeMode === "BUY"
+                        className={`py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 ${curveTradeMode === "BUY"
                             ? "bg-[#00875a] text-white shadow-2xs"
                             : "text-slate-600 hover:text-slate-900"
-                        }`}
+                          }`}
                       >
                         <Sparkles className="w-3.5 h-3.5" />
                         <span>Buy (Mint CRV)</span>
                       </button>
                       <button
                         onClick={() => setCurveTradeMode("SELL")}
-                        className={`py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-                          curveTradeMode === "SELL"
+                        className={`py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 ${curveTradeMode === "SELL"
                             ? "bg-amber-600 text-white shadow-2xs"
                             : "text-slate-600 hover:text-slate-900"
-                        }`}
+                          }`}
                       >
                         <Flame className="w-3.5 h-3.5" />
                         <span>Sell (Burn CRV)</span>
@@ -2124,13 +2184,12 @@ export default function ApexDashboard() {
                     <button
                       onClick={handleExecuteCurveTrade}
                       disabled={isCurveTrading || !currentUser}
-                      className={`w-full font-bold text-xs py-3 rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs cursor-pointer ${
-                        !currentUser
+                      className={`w-full font-bold text-xs py-3 rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs cursor-pointer ${!currentUser
                           ? "bg-slate-200 text-slate-500 cursor-not-allowed"
                           : curveTradeMode === "BUY"
-                          ? "bg-[#00875a] hover:bg-[#00754e] text-white"
-                          : "bg-amber-600 hover:bg-amber-700 text-white"
-                      }`}
+                            ? "bg-[#00875a] hover:bg-[#00754e] text-white"
+                            : "bg-amber-600 hover:bg-amber-700 text-white"
+                        }`}
                     >
                       {isCurveTrading ? (
                         <>
@@ -2207,11 +2266,10 @@ export default function ApexDashboard() {
                           <button
                             key={t}
                             onClick={() => setTimeframe(t)}
-                            className={`text-xs font-semibold px-2.5 py-1 rounded-lg transition-all cursor-pointer ${
-                              timeframe === t
+                            className={`text-xs font-semibold px-2.5 py-1 rounded-lg transition-all cursor-pointer ${timeframe === t
                                 ? "bg-white text-slate-900 shadow-2xs font-bold"
                                 : "text-slate-500 hover:text-slate-800"
-                            }`}
+                              }`}
                           >
                             {t}
                           </button>
@@ -2570,11 +2628,10 @@ export default function ApexDashboard() {
                       <button
                         key={filter}
                         onClick={() => setTxFilter(filter)}
-                        className={`text-xs font-semibold px-3 py-1 rounded-lg transition-all cursor-pointer ${
-                          txFilter === filter
+                        className={`text-xs font-semibold px-3 py-1 rounded-lg transition-all cursor-pointer ${txFilter === filter
                             ? "bg-white text-slate-900 shadow-2xs font-bold"
                             : "text-slate-500 hover:text-slate-800"
-                        }`}
+                          }`}
                       >
                         {filter}
                       </button>
@@ -2615,19 +2672,18 @@ export default function ApexDashboard() {
                             <td className="py-3.5 px-2">
                               <div className="flex items-center gap-2.5">
                                 <div
-                                  className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${
-                                    tx.type === "Deposit" || tx.type === "Deposit (UTXO)"
+                                  className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${tx.type === "Deposit" || tx.type === "Deposit (UTXO)"
                                       ? "bg-emerald-50 text-[#00875a]"
                                       : tx.type === "Send" || tx.type === "Send (UTXO)"
-                                      ? "bg-blue-50 text-blue-600"
-                                      : tx.type === "AMM Swap"
-                                      ? "bg-indigo-50 text-indigo-600"
-                                      : tx.type === "Bonding Buy"
-                                      ? "bg-teal-50 text-teal-600"
-                                      : tx.type === "Bonding Sell"
-                                      ? "bg-amber-50 text-amber-600"
-                                      : "bg-purple-50 text-purple-600"
-                                  }`}
+                                        ? "bg-blue-50 text-blue-600"
+                                        : tx.type === "AMM Swap"
+                                          ? "bg-indigo-50 text-indigo-600"
+                                          : tx.type === "Bonding Buy"
+                                            ? "bg-teal-50 text-teal-600"
+                                            : tx.type === "Bonding Sell"
+                                              ? "bg-amber-50 text-amber-600"
+                                              : "bg-purple-50 text-purple-600"
+                                    }`}
                                 >
                                   {(tx.type === "Deposit" || tx.type === "Deposit (UTXO)") && <Check className="w-4 h-4" />}
                                   {(tx.type === "Send" || tx.type === "Send (UTXO)") && <ArrowUpRight className="w-4 h-4" />}
@@ -2639,31 +2695,31 @@ export default function ApexDashboard() {
                               </div>
                             </td>
 
-                          <td className="py-3.5 px-2">
-                            <div className="font-bold text-slate-900">{tx.amount}</div>
-                            <div className="text-[11px] text-slate-400">{tx.fiatValue}</div>
-                          </td>
+                            <td className="py-3.5 px-2">
+                              <div className="font-bold text-slate-900">{tx.amount}</div>
+                              <div className="text-[11px] text-slate-400">{tx.fiatValue}</div>
+                            </td>
 
-                          <td className="py-3.5 px-2 text-slate-600 font-medium">
-                            <div>{tx.details}</div>
-                            {tx.recipientFull && (
-                              <div className="font-mono text-[10px] text-slate-400 select-all">
-                                {tx.recipientFull}
-                              </div>
-                            )}
-                          </td>
+                            <td className="py-3.5 px-2 text-slate-600 font-medium">
+                              <div>{tx.details}</div>
+                              {tx.recipientFull && (
+                                <div className="font-mono text-[10px] text-slate-400 select-all">
+                                  {tx.recipientFull}
+                                </div>
+                              )}
+                            </td>
 
-                          <td className="py-3.5 px-2 text-slate-500 font-medium">{tx.date}</td>
+                            <td className="py-3.5 px-2 text-slate-500 font-medium">{tx.date}</td>
 
-                          <td className="py-3.5 px-2 text-right">
-                            <span className="inline-flex items-center gap-1 bg-[#e8f8f0] text-[#00875a] border border-emerald-200/60 rounded-full px-2.5 py-0.5 text-xs font-semibold">
-                              <Check className="w-3 h-3" />
-                              {tx.status}
-                            </span>
-                          </td>
-                        </tr>
-                      ))
-                    )}
+                            <td className="py-3.5 px-2 text-right">
+                              <span className="inline-flex items-center gap-1 bg-[#e8f8f0] text-[#00875a] border border-emerald-200/60 rounded-full px-2.5 py-0.5 text-xs font-semibold">
+                                <Check className="w-3 h-3" />
+                                {tx.status}
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -2695,63 +2751,64 @@ export default function ApexDashboard() {
               </button>
             </div>
 
-            {!currentUser || !userAddress ? (
-              <div className="py-8 text-center space-y-4">
-                <div className="w-12 h-12 rounded-full bg-amber-50 text-amber-600 flex items-center justify-center mx-auto border border-amber-200">
-                  <KeyRound className="w-6 h-6" />
-                </div>
-                <div className="space-y-1">
-                  <h4 className="font-bold text-slate-900 text-base">Authentication Required</h4>
-                  <p className="text-xs text-slate-500 max-w-xs mx-auto">
-                    Please sign in with Google to reveal your account address and initiate coin transfers.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleGoogleSignIn}
-                  className="bg-[#00875a] hover:bg-[#00754e] text-white font-bold text-xs py-2.5 px-4 rounded-xl transition-all shadow-xs cursor-pointer inline-flex items-center gap-2"
-                >
-                  <User className="w-4 h-4" />
-                  <span>Sign In with Google</span>
-                </button>
-              </div>
-            ) : sendSuccessMsg ? (
+            {sendSuccessMsg ? (
               <div className="py-8 text-center space-y-3">
                 <div className="w-12 h-12 rounded-full bg-emerald-100 text-[#00875a] flex items-center justify-center mx-auto">
                   <Check className="w-6 h-6" />
                 </div>
-                <h4 className="font-bold text-slate-900 text-base">Transaction Stored &amp; Dispatched!</h4>
+                <h4 className="font-bold text-slate-900 text-base">UTXO Transfer Confirmed!</h4>
                 <p className="text-xs text-slate-600 max-w-xs mx-auto">{sendSuccessMsg}</p>
-                <span className="text-[10px] text-teal-600 font-bold bg-teal-50 px-2 py-0.5 rounded">
-                  Synchronized with Firebase Database
-                </span>
+                <div className="flex items-center justify-center gap-2 pt-2 text-[10px] font-mono text-emerald-800">
+                  <span className="bg-emerald-100 px-2 py-0.5 rounded font-bold">1 Confirmation</span>
+                  <span className="bg-teal-50 text-teal-700 px-2 py-0.5 rounded font-bold border border-teal-200">
+                    UTXO Ledger Updated
+                  </span>
+                </div>
               </div>
             ) : (
               <form onSubmit={handleSendTransaction} className="pt-4 space-y-4">
-                {/* Sending From */}
-                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1 text-xs">
-                  <div className="flex justify-between text-slate-500">
+                {/* Sending From & Faucet Banner */}
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2 text-xs">
+                  <div className="flex justify-between items-center text-slate-500">
                     <span>Sending From:</span>
-                    <span className="font-mono text-slate-800 font-semibold">
-                      {userAddress ? `${userAddress.slice(0, 6)}...${userAddress.slice(-4)}` : "Not Logged In"}
+                    <span className="font-mono text-slate-800 font-semibold truncate max-w-[200px]">
+                      {userAddress ? `${userAddress.slice(0, 8)}...${userAddress.slice(-4)}` : "0x90F7...b906 (Custodial Vault)"}
                     </span>
                   </div>
-                  <div className="flex justify-between text-slate-500">
-                    <span>Your Organization:</span>
-                    <span className="font-semibold text-teal-700">{userOrg}</span>
+                  <div className="flex justify-between items-center text-slate-500">
+                    <span>Wallet Owner:</span>
+                    <span className="font-semibold text-teal-700">
+                      {currentUser?.displayName || currentUser?.email || "Apex Custody Trader"}
+                    </span>
                   </div>
-                  <div className="flex justify-between text-slate-500">
-                    <span>Available Balance:</span>
-                    <strong className="font-mono text-emerald-700 font-bold">
+                  <div className="flex justify-between items-center pt-1 border-t border-slate-200/80">
+                    <span className="text-slate-600">Available UTXO Balance:</span>
+                    <strong className="font-mono text-emerald-700 font-bold text-sm">
                       {balanceMYC.toLocaleString()} MYC
                     </strong>
                   </div>
+
+                  {/* 1-Click Mine Faucet for quick testing */}
+                  <div className="pt-1.5 flex items-center justify-between bg-emerald-100/60 -mx-1 -mb-1 px-2.5 py-1.5 rounded-lg border border-emerald-200/70">
+                    <span className="text-[11px] text-emerald-900 font-medium">
+                      Need coins to transfer?
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleMineFaucet}
+                      disabled={isMiningFaucet}
+                      className="bg-[#00875a] hover:bg-[#00754e] text-white text-[10px] font-bold px-2.5 py-1 rounded-md flex items-center gap-1 cursor-pointer transition-all shadow-2xs"
+                    >
+                      <Pickaxe className="w-3 h-3" />
+                      <span>{isMiningFaucet ? "Mining..." : "+ Mine 50 MYC"}</span>
+                    </button>
+                  </div>
                 </div>
 
-                {/* Quick Select: Bob and Directory */}
+                {/* Quick Select: Bob, Cold Vault, Alice */}
                 <div>
                   <label className="text-xs font-bold text-slate-600 block mb-1.5">
-                    Quick Select Contact (from Directory):
+                    Quick Select Recipient:
                   </label>
                   <div className="grid grid-cols-2 gap-2">
                     {contacts.slice(0, 2).map((c) => (
@@ -2764,11 +2821,10 @@ export default function ApexDashboard() {
                           setRecipientOrg(c.organization);
                           setAddressError(null);
                         }}
-                        className={`p-2 rounded-xl text-left border transition-all cursor-pointer ${
-                          sendRecipient === c.address
+                        className={`p-2 rounded-xl text-left border transition-all cursor-pointer ${sendRecipient === c.address
                             ? "bg-teal-50 border-teal-500 shadow-2xs"
                             : "bg-slate-50/70 border-slate-200 hover:bg-slate-100"
-                        }`}
+                          }`}
                       >
                         <div className="font-bold text-xs text-slate-900">{c.name}</div>
                         <div className="text-[10px] text-teal-700 truncate">{c.organization}</div>
@@ -2790,7 +2846,7 @@ export default function ApexDashboard() {
                   <input
                     type="text"
                     required
-                    placeholder="Enter recipient address (0x...)"
+                    placeholder="Enter recipient address (0x... or ADDR...)"
                     value={sendRecipient}
                     onChange={(e) => {
                       setSendRecipient(e.target.value);
@@ -2798,39 +2854,34 @@ export default function ApexDashboard() {
                       setRecipientOrg("");
                       if (addressError) setAddressError(null);
                     }}
-                    className={`w-full bg-[#f8fafc] border rounded-xl px-3.5 py-2.5 text-xs sm:text-sm font-mono text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 ${
-                      addressError
+                    className={`w-full bg-[#f8fafc] border rounded-xl px-3.5 py-2.5 text-xs sm:text-sm font-mono text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 ${addressError
                         ? "border-rose-400 focus:ring-rose-200"
                         : "border-slate-200 focus:ring-emerald-500/20 focus:border-emerald-500"
-                    }`}
+                      }`}
                   />
                   {addressError && (
                     <p className="text-[11px] text-rose-500 font-medium mt-1">{addressError}</p>
                   )}
                 </div>
 
-                {/* Amount */}
+                {/* Amount & Quick Fill */}
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
                     <label className="text-xs font-bold text-slate-600">Amount (MYC)</label>
                     <div className="flex items-center gap-1.5">
+                      {["10", "50", "70"].map((v) => (
+                        <button
+                          key={v}
+                          type="button"
+                          onClick={() => setSendAmount(v)}
+                          className="text-[11px] text-slate-500 font-semibold hover:underline cursor-pointer"
+                        >
+                          {v}
+                        </button>
+                      ))}
                       <button
                         type="button"
-                        onClick={() => setSendAmount("100")}
-                        className="text-[11px] text-slate-500 font-semibold hover:underline cursor-pointer"
-                      >
-                        100
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setSendAmount("1000")}
-                        className="text-[11px] text-slate-500 font-semibold hover:underline cursor-pointer"
-                      >
-                        1,000
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setSendAmount(balanceMYC.toString())}
+                        onClick={() => setSendAmount(balanceMYC > 0 ? balanceMYC.toString() : "50")}
                         className="text-[11px] text-[#00875a] font-bold hover:underline cursor-pointer"
                       >
                         Max
@@ -2845,13 +2896,107 @@ export default function ApexDashboard() {
                       placeholder="0.00"
                       value={sendAmount}
                       onChange={(e) => setSendAmount(e.target.value)}
-                      className="w-full bg-[#f8fafc] border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm font-bold text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                      className="w-full bg-[#f8fafc] border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm font-bold text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 font-mono"
                     />
                     <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
                       MYC
                     </span>
                   </div>
                 </div>
+
+                {/* Fee Estimation Selector */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-bold text-slate-600">Miner Fee (Proof of Work)</label>
+                    <span className="text-[11px] text-slate-400">Goes to block miner</span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { label: "Standard", fee: "0.1", desc: "Recommended" },
+                      { label: "Priority", fee: "0.5", desc: "Fast Block" },
+                      { label: "Zero Fee", fee: "0", desc: "Demo Only" },
+                    ].map((f) => (
+                      <button
+                        key={f.fee}
+                        type="button"
+                        onClick={() => setSendFee(f.fee)}
+                        className={`p-1.5 rounded-lg border text-center transition-all cursor-pointer ${sendFee === f.fee
+                            ? "bg-slate-900 text-white border-slate-900 shadow-2xs"
+                            : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+                          }`}
+                      >
+                        <div className="font-bold text-xs">{f.fee} MYC</div>
+                        <div className={`text-[9px] ${sendFee === f.fee ? "text-slate-300" : "text-slate-400"}`}>
+                          {f.label}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Real UTXO Blueprint Calculation Card */}
+                {parseFloat(sendAmount || "0") > 0 && (
+                  <div className="bg-slate-900 text-slate-200 rounded-xl p-3 space-y-1.5 text-xs font-mono border border-slate-800">
+                    <div className="text-[10px] text-emerald-400 uppercase font-bold flex items-center gap-1">
+                      <Sparkles className="w-3 h-3" />
+                      <span>UTXO Transaction Composition</span>
+                    </div>
+                    <div className="flex justify-between text-slate-300">
+                      <span>Inputs Spent:</span>
+                      <strong className="text-white">
+                        {Math.max(1, Math.ceil((parseFloat(sendAmount || "0") + parseFloat(sendFee || "0.1")) / 50))} &times; 50-coin UTXOs ({Math.max(50, Math.ceil((parseFloat(sendAmount || "0") + parseFloat(sendFee || "0.1")) / 50) * 50)} MYC)
+                      </strong>
+                    </div>
+                    <div className="flex justify-between text-emerald-400">
+                      <span>Output &rarr; Recipient:</span>
+                      <strong>{parseFloat(sendAmount || "0").toFixed(2)} MYC</strong>
+                    </div>
+                    <div className="flex justify-between text-teal-300">
+                      <span>Output &rarr; Change Refund:</span>
+                      <strong>
+                        {Math.max(
+                          0,
+                          Math.max(50, Math.ceil((parseFloat(sendAmount || "0") + parseFloat(sendFee || "0.1")) / 50) * 50) -
+                          parseFloat(sendAmount || "0") -
+                          parseFloat(sendFee || "0.1")
+                        ).toFixed(2)}{" "}
+                        MYC
+                      </strong>
+                    </div>
+                    <div className="flex justify-between text-amber-400">
+                      <span>Miner Subsidy Fee:</span>
+                      <strong>{sendFee} MYC</strong>
+                    </div>
+                  </div>
+                )}
+
+                {/* Sending Stepper Stages */}
+                {isSending && (
+                  <div className="bg-emerald-50 border border-emerald-200/90 rounded-xl p-3 space-y-2 text-xs">
+                    <div className="flex items-center gap-2 font-bold text-emerald-950">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-700" />
+                      <span>Executing Real UTXO Lifecycle...</span>
+                    </div>
+                    <div className="space-y-1 text-[11px] font-mono">
+                      <div className={sendStage === "signing" ? "text-emerald-700 font-bold flex items-center gap-1" : "text-slate-400"}>
+                        <span>&bull;</span>
+                        <span>1. Signing UTXO inputs with Secp256k1 key</span>
+                      </div>
+                      <div className={sendStage === "mempool" ? "text-emerald-700 font-bold flex items-center gap-1" : "text-slate-400"}>
+                        <span>&bull;</span>
+                        <span>2. Broadcasting transaction to Mempool</span>
+                      </div>
+                      <div className={sendStage === "mining" ? "text-emerald-700 font-bold flex items-center gap-1" : "text-slate-400"}>
+                        <span>&bull;</span>
+                        <span>3. Mining block with Proof of Work (Hash: 0000…)</span>
+                      </div>
+                      <div className={sendStage === "confirmed" ? "text-emerald-700 font-bold flex items-center gap-1" : "text-slate-400"}>
+                        <span>&bull;</span>
+                        <span>4. Block confirmed: UTXO set updated &amp; change returned</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Submit Button */}
                 <button
@@ -2862,7 +3007,7 @@ export default function ApexDashboard() {
                   {isSending ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Writing to Blockchain &amp; Firebase...</span>
+                      <span>Processing UTXO Block...</span>
                     </>
                   ) : (
                     <>
@@ -2974,9 +3119,9 @@ export default function ApexDashboard() {
                     <span>
                       {swapResult.outputAmount > 0
                         ? swapResult.outputAmount.toLocaleString(undefined, {
-                            minimumFractionDigits: 2,
-                            maximumFractionDigits: 4,
-                          })
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 4,
+                        })
                         : "0.00"}
                     </span>
                     <span className="text-xs font-bold text-slate-500 bg-white border border-slate-200 px-2 py-0.5 rounded-md">

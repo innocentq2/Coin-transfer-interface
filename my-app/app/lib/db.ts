@@ -76,7 +76,7 @@ export const DEFAULT_KNOWN_ACCOUNTS: KnownAccount[] = [
     email: "bob.trader@apexcustody.com",
     role: "Senior OTC Liquidity Provider",
     avatarColor: "bg-blue-600",
-    mycBalance: 0, // Starts at 0, credited on UTXO payment
+    mycBalance: 0, // Starts at 0; credited upon receiving transfer or buying
     ethBalance: 5.0,
   },
   {
@@ -87,8 +87,19 @@ export const DEFAULT_KNOWN_ACCOUNTS: KnownAccount[] = [
     email: "alice@consensuscap.io",
     role: "Treasury Asset Manager",
     avatarColor: "bg-purple-600",
-    mycBalance: 0, // Starts at 0, credited on UTXO payment
-    ethBalance: 5.0,
+    mycBalance: 0,
+    ethBalance: 8.5,
+  },
+  {
+    id: "acc-carol",
+    name: "Carol",
+    organization: "Cross-Chain Settlement Corp",
+    address: "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
+    email: "carol@settlement.org",
+    role: "Institutional Partner",
+    avatarColor: "bg-amber-600",
+    mycBalance: 0,
+    ethBalance: 3.2,
   },
   {
     id: "acc-vault",
@@ -99,7 +110,7 @@ export const DEFAULT_KNOWN_ACCOUNTS: KnownAccount[] = [
     role: "Multi-Sig Cold Custodian",
     avatarColor: "bg-emerald-600",
     mycBalance: 0,
-    ethBalance: 10.0,
+    ethBalance: 15.0,
   },
 ];
 

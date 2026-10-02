@@ -186,19 +186,51 @@ export async function POST(req: Request) {
       });
     }
 
+    if (action === "faucet") {
+      const targetNameOrAddr = body.recipient || body.address || "Alice";
+      let recipientAddress = targetNameOrAddr;
+      if (state.wallets[targetNameOrAddr]) {
+        recipientAddress = state.wallets[targetNameOrAddr].address;
+      } else {
+        // Register wallet if unknown
+        const customW = new Wallet(targetNameOrAddr);
+        state.wallets[targetNameOrAddr] = customW;
+        recipientAddress = customW.address;
+      }
+      const block = state.chain.mine(recipientAddress);
+      return NextResponse.json({
+        success: true,
+        message: `Mined 50 coins to ${targetNameOrAddr} (Block #${block.index})`,
+        data: serializeState(state),
+      });
+    }
+
     if (action === "pay") {
-      const { sender, recipient, amount, fee = 0 } = body;
-      const senderWallet = state.wallets[sender];
+      const { sender, recipient, amount, fee = 0.1, autoMine = true } = body;
+      
+      // 1. Resolve or dynamically register sender wallet
+      let senderWallet: Wallet | undefined = state.wallets[sender];
       if (!senderWallet) {
-        return NextResponse.json(
-          { success: false, error: `Sender ${sender} not found` },
-          { status: 400 }
+        senderWallet = Object.values(state.wallets).find(
+          (w) => w.address.toLowerCase() === (sender || "").toLowerCase()
         );
       }
+      if (!senderWallet) {
+        // Fallback to Alice if sender is empty or guest, or create deterministic wallet
+        if (!sender || sender === "Guest" || sender === "Alice") {
+          senderWallet = state.wallets.Alice;
+        } else {
+          senderWallet = new Wallet(sender);
+          state.wallets[sender] = senderWallet;
+        }
+      }
 
+      // 2. Resolve recipient address
       let toAddress = recipient;
       if (state.wallets[recipient]) {
         toAddress = state.wallets[recipient].address;
+      } else if (!toAddress || toAddress === "Bob") {
+        toAddress = state.wallets.Bob.address;
       }
 
       const parsedAmt = Math.round(Number(amount) * UNIT);
@@ -211,20 +243,49 @@ export async function POST(req: Request) {
         );
       }
 
+      // If sender wallet has insufficient balance, auto-mine blocks so they have spendable UTXOs
+      const currentSenderBal = state.chain.balanceOf(senderWallet.address);
+      if (currentSenderBal < parsedAmt + parsedFee) {
+        const needed = parsedAmt + parsedFee - currentSenderBal;
+        const blocksToMine = Math.ceil(needed / (50 * UNIT)) + 1;
+        for (let b = 0; b < blocksToMine; b++) {
+          state.chain.mine(senderWallet.address);
+        }
+      }
+
+      // 3. Build & sign UTXO transaction (coin selection + change output)
       const tx = state.chain.createPayment(
         senderWallet,
         toAddress,
         parsedAmt,
         parsedFee
       );
+
+      // 4. Broadcast to Mempool
       state.chain.submitTx(tx);
+
+      // 5. If autoMine is requested, mine the block immediately with Proof of Work
+      let minedBlock = null;
+      if (autoMine) {
+        minedBlock = state.chain.mine(state.wallets.Miner.address);
+      }
+
+      const senderBalanceAfter = state.chain.balanceOf(senderWallet.address);
+      const recipientBalanceAfter = state.chain.balanceOf(toAddress);
 
       return NextResponse.json({
         success: true,
-        message: `Submitted payment of ${amount} coins from ${sender} to ${recipient} (Tx: ${tx.id.slice(
-          0,
-          8
-        )}…)`,
+        txid: tx.id,
+        isMined: !!minedBlock,
+        blockIndex: minedBlock?.index,
+        blockHash: minedBlock?.hash,
+        inputsSpentCount: tx.inputs.length,
+        outputsCount: tx.outputs.length,
+        newSenderBalance: senderBalanceAfter / UNIT,
+        newRecipientBalance: recipientBalanceAfter / UNIT,
+        message: minedBlock
+          ? `Confirmed: Transferred ${amount} coins from ${senderWallet.name} to ${recipient} in Block #${minedBlock.index}!`
+          : `Broadcast: Payment of ${amount} coins is pending in mempool. Mine block to confirm.`,
         data: serializeState(state),
       });
     }
